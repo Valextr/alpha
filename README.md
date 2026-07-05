@@ -69,7 +69,7 @@ Not forked. Not locked in. Just reference.
 
 - ✅ **Phase 0:** Project setup
 - ✅ **Phase 1:** Data Pipeline (yfinance prototype, 58 tickers, 14.5K bars)
-- ⬜ Phase 2: Feature Store
+- 🟡 **Phase 2:** Feature Store (20/30+ features: price + volatility done, volume/cross-sectional/regime/advanced next)
 - ⬜ Phase 3: Signal Factory
 - ⬜ Phase 4: Ensemble & Weights
 - ⬜ Phase 5: Portfolio & Risk
