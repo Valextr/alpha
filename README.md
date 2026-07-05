@@ -30,6 +30,25 @@ Data Pipeline → Feature Store → Signal Factory → Ensemble → Portfolio �
 | Execution | Interactive Brokers (`ib_insync`) |
 | Monitoring | Custom analytics + forward-test dashboard |
 
+## Quick Start
+
+```bash
+# Install dependencies
+pip install polars duckdb pyarrow yfinance requests tqdm pydantic loguru
+
+# Run pipeline (default universe, 10+ years)
+python -m src.data.ingestion run
+
+# Fetch specific tickers
+python -m src.data.ingestion run --tickers AAPL MSFT GOOGL --start 2020-01-01
+
+# Query via DuckDB
+python -m src.data.catalog stats
+
+# Validate data quality
+python -m src.data.validate gold
+```
+
 ## Reference
 
 `gurmansaran/medallion-pub` serves as a reference library for:
@@ -42,15 +61,15 @@ Not forked. Not locked in. Just reference.
 
 ## Status
 
-🟢 Phase 0: Project setup
-⬜ Phase 1: Data Pipeline
-⬜ Phase 2: Feature Store
-⬜ Phase 3: Signal Factory
-⬜ Phase 4: Ensemble & Weights
-⬜ Phase 5: Portfolio & Risk
-⬜ Phase 6: Validation Engine
-⬜ Phase 7: Paper Trading
-⬜ Phase 8: Forward Test (6+ months)
+- ✅ **Phase 0:** Project setup
+- ✅ **Phase 1:** Data Pipeline (yfinance prototype, 58 tickers, 14.5K bars)
+- ⬜ Phase 2: Feature Store
+- ⬜ Phase 3: Signal Factory
+- ⬜ Phase 4: Ensemble & Weights
+- ⬜ Phase 5: Portfolio & Risk
+- ⬜ Phase 6: Validation Engine
+- ⬜ Phase 7: Paper Trading
+- ⬜ Phase 8: Forward Test (6+ months)
 
 ## License
 
