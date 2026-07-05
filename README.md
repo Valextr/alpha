@@ -33,20 +33,26 @@ Data Pipeline → Feature Store → Signal Factory → Ensemble → Portfolio �
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install polars duckdb pyarrow yfinance requests tqdm pydantic loguru
+# Install uv (if not already)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Sync dependencies (creates .venv, installs everything)
+uv sync --all-extras
 
 # Run pipeline (default universe, 10+ years)
-python -m src.data.ingestion run
+uv run python -m src.data.ingestion run
 
 # Fetch specific tickers
-python -m src.data.ingestion run --tickers AAPL MSFT GOOGL --start 2020-01-01
+uv run python -m src.data.ingestion run --tickers AAPL MSFT GOOGL --start 2020-01-01
 
 # Query via DuckDB
-python -m src.data.catalog stats
+uv run python -m src.data.catalog stats
 
 # Validate data quality
-python -m src.data.validate gold
+uv run python -m src.data.validate gold
+
+# Run tests
+uv run pytest
 ```
 
 ## Reference
