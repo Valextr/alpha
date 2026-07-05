@@ -1,0 +1,1 @@
+# Alpha — Quantitative Trading System

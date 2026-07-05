@@ -14,7 +14,7 @@ venv/
 env/
 
 # Data (never commit raw data)
-data/
+/data/
 *.parquet
 *.feather
 *.arrow
