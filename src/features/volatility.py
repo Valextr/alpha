@@ -17,7 +17,7 @@ from .registry import registry
 def compute_vol_5d(df):
     return df.with_columns(
         pl.col("log_return_1d")
-        .rolling_std(window_size=5, min_periods=3)
+        .rolling_std(window_size=5, min_samples=3)
         .alias("vol_5d")
     )
 
@@ -32,7 +32,7 @@ def compute_vol_5d(df):
 def compute_vol_21d(df):
     return df.with_columns(
         pl.col("log_return_1d")
-        .rolling_std(window_size=21, min_periods=10)
+        .rolling_std(window_size=21, min_samples=10)
         .alias("vol_21d")
     )
 
@@ -47,7 +47,7 @@ def compute_vol_21d(df):
 def compute_vol_63d(df):
     return df.with_columns(
         pl.col("log_return_1d")
-        .rolling_std(window_size=63, min_periods=30)
+        .rolling_std(window_size=63, min_samples=30)
         .alias("vol_63d")
     )
 
@@ -75,7 +75,7 @@ def compute_vol_annual(df):
 def compute_vol_of_vol_21d(df):
     return df.with_columns(
         pl.col("vol_5d")
-        .rolling_std(window_size=21, min_periods=10)
+        .rolling_std(window_size=21, min_samples=10)
         .alias("vol_of_vol_21d")
     )
 

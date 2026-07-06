@@ -5,7 +5,7 @@ import importlib
 import polars as pl
 
 from .registry import registry
-from . import price, volatility  # noqa: F401 - triggers auto-registration
+from . import price, volatility, volume, cross_sectional, regime  # noqa: F401
 from .base import validate_features
 
 
@@ -16,9 +16,9 @@ def _feature_module(feature_name):
         return "price"
     elif feature_name.startswith(("vol_", "vol_of_vol", "vol_ratio")):
         return "volatility"
-    elif feature_name.startswith(("relative_volume", "accum_", "volume_")):
+    elif feature_name.startswith(("relative_volume", "accumulation_", "volume_")):
         return "volume"
-    elif feature_name.startswith("cs_"):
+    elif feature_name.startswith(("cs_", "sector_")):
         return "cross_sectional"
     elif feature_name.startswith("regime_"):
         return "regime"

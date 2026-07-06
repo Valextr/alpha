@@ -147,7 +147,7 @@ def compute_drawdown_from_peak(df):
     return df.with_columns(
         (
             pl.col("close")
-            / pl.col("close").rolling_max(window_size=252, min_periods=1)
+            / pl.col("close").rolling_max(window_size=252, min_samples=1)
             - 1
         ).alias("drawdown_from_peak")
     )

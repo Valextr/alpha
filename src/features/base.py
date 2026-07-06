@@ -16,12 +16,12 @@ class Feature(ABC):
         pass
 
 
-def safe_rolling(series, func, window, min_periods=None):
+def safe_rolling(series, func, window, min_samples=None):
     """Wrapper for rolling operations that handles edge cases."""
-    if min_periods is None:
-        min_periods = max(1, window // 2)
+    if min_samples is None:
+        min_samples = max(1, window // 2)
 
-    kwargs = {"window_size": window, "min_periods": min_periods}
+    kwargs = {"window_size": window, "min_samples": min_samples}
 
     if func == "std":
         return series.rolling_std(**kwargs)
@@ -42,21 +42,51 @@ def compute_cross_sectional(df, value_col, method="zscore", group_by="date"):
 
     All computations are point-in-time correct: statistics are computed
     within each date group, never across dates.
+
+    Args:
+        df: Input DataFrame
+        value_col: Column to compute statistics on
+        method: "zscore", "rank", or "percentile"
+        group_by: Column to group by (default: "date")
+
+    Returns:
+        DataFrame with new column named "{value_col}_{method}"
     """
     out_col = f"{value_col}_{method}"
 
     if method == "zscore":
-        expr = pl.col(value_col).map_groups(
-            lambda s: (s - s.mean()) / s.std().replace(0, None)
+        # Use group-by aggregation instead of map_groups (removed in Polars 1.21+)
+        stats = (
+            df.group_by(group_by)
+            .agg([
+                pl.col(value_col).mean().alias("_mean"),
+                pl.col(value_col).std().alias("_std"),
+            ])
+            .with_columns(pl.col("_std").replace(0, None))
+        )
+        return (
+            df.join(stats, on=group_by, how="left")
+            .with_columns(
+                ((pl.col(value_col) - pl.col("_mean")) / pl.col("_std")).alias(out_col)
+            )
+            .drop("_mean", "_std")
         )
     elif method == "rank":
-        expr = pl.col(value_col).rank("average") / pl.col(value_col).count()
+        return df.with_columns(
+            (
+                pl.col(value_col).rank("average").over(group_by)
+                / pl.col(value_col).count().over(group_by)
+            ).alias(out_col)
+        )
     elif method == "percentile":
-        expr = pl.col(value_col).rank("average") / pl.col(value_col).count() * 100
+        return df.with_columns(
+            (
+                pl.col(value_col).rank("average").over(group_by)
+                / pl.col(value_col).count().over(group_by) * 100
+            ).alias(out_col)
+        )
     else:
         raise ValueError(f"Unknown cross-sectional method: {method}")
-
-    return df.with_columns(expr.over(group_by).alias(out_col))
 
 
 def validate_features(df):

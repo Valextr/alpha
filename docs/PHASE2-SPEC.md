@@ -215,9 +215,9 @@ src/features/
 - [x] Price features (14 features)
 - [x] Volatility features (6 features)
 - [x] Pipeline orchestrator
-- [ ] Volume features
-- [ ] Cross-sectional features
-- [ ] Regime features
+- [x] Volume features (4 features: relative_volume_21d, volume_zscore_63d, accumulation_distribution, volume_shock)
+- [x] Cross-sectional features (5 features: cs_return_zscore_21d, cs_return_rank_21d, cs_vol_rank_21d, cs_volume_rank_21d, sector_relative_return_21d)
+- [x] Regime features (4 features: regime_market_trend, regime_vol_state, regime_breadth, regime_vol_regime)
 - [ ] Advanced features
 - [ ] Full validation test suite
 
