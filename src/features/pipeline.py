@@ -5,7 +5,7 @@ import importlib
 import polars as pl
 
 from .registry import registry
-from . import price, volatility, volume, cross_sectional, regime  # noqa: F401
+from . import price, volatility, volume, cross_sectional, regime, advanced  # noqa: F401
 from .base import validate_features
 
 
