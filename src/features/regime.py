@@ -53,7 +53,9 @@ def compute_regime_vol_state(df):
     return df.with_columns(
         (
             pl.col("vol_21d")
-            / pl.col("vol_21d").rolling_max(window_size=252, min_samples=126)
+            / pl.col("vol_21d")
+            .rolling_max(window_size=252, min_samples=126)
+            .over("ticker")
         ).alias("regime_vol_state")
     )
 
@@ -74,7 +76,7 @@ def compute_regime_breadth(df):
     df_with_flag = df.with_columns(
         pl.when(
             pl.col("close")
-            > pl.col("close").rolling_mean(window_size=20, min_samples=10)
+            > pl.col("close").rolling_mean(window_size=20, min_samples=10).over("ticker")
         )
         .then(pl.lit(1))
         .otherwise(pl.lit(0))
@@ -105,6 +107,7 @@ def compute_regime_vol_regime(df):
     return df.with_columns(
         pl.col("vol_of_vol_21d")
         .rolling_median(window_size=252, min_samples=126)
+        .over("ticker")
         .alias("_vol_of_vol_median")
     ).with_columns(
         pl.when(pl.col("vol_of_vol_21d") > pl.col("_vol_of_vol_median"))
