@@ -25,6 +25,9 @@ from .enrich import build_gold_layer
 from .catalog import create_catalog
 from .validate import run_all_checks
 
+# Staleness threshold — data older than this is re-fetched
+STALENESS_THRESHOLD_DAYS = 1
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +94,34 @@ def save_parquet(
     )
 
 
+def save_parquet_partitioned_by_year(
+    df: pl.DataFrame,
+    output_dir: Path,
+    ticker: str = None,
+) -> None:
+    """Save DataFrame as Parquet, partitioning rows into year=YYYY folders.
+
+    Unlike save_parquet which takes a single year argument, this function
+    groups the DataFrame by the actual year of each row's date column so
+    data spanning multiple years lands in the correct partitions.
+
+    Args:
+        df: DataFrame with a 'date' column
+        output_dir: Base output directory
+        ticker: Ticker symbol for partitioning
+    """
+    if df.is_empty() or "date" not in df.columns:
+        return
+
+    df = df.with_columns(
+        pl.col("date").dt.year().cast(pl.Utf8).alias("_year")
+    )
+    for year, year_df in df.group_by("_year", maintain_order=True):
+        year_str = str(year[0])
+        year_df = year_df.drop("_year")
+        save_parquet(year_df, output_dir, ticker=ticker, year=year_str)
+
+
 async def fetch_bronze_for_ticker(
     source,
     ticker: str,
@@ -105,15 +136,12 @@ async def fetch_bronze_for_ticker(
         "actions": await source.fetch_corporate_actions(ticker, start, end),
     }
 
-    # Save bronze data — partitioned by ticker
+    # Save bronze data — partitioned by year and ticker
     if not result["bars"].is_empty():
-        # Get year from first date
-        year = str(result["bars"]["date"].min())[:4] if not result["bars"]["date"].is_empty() else "unknown"
-        save_parquet(
+        save_parquet_partitioned_by_year(
             result["bars"],
             config.data_dir / "bronze" / "daily",
             ticker=ticker,
-            year=year,
         )
 
     if not result["dividends"].is_empty():
@@ -216,30 +244,26 @@ async def run_pipeline(
     logger.info("Step 2: Building silver layer...")
     silver = build_silver_layer(bronze_bars, bronze_divs, bronze_actions)
 
-    # Save silver — partitioned by ticker
+    # Save silver — partitioned by year and ticker
     for ticker in silver["ticker"].unique():
         ticker_data = silver.filter(pl.col("ticker") == ticker)
-        year = str(ticker_data["date"].min())[:4] if not ticker_data["date"].is_empty() else "unknown"
-        save_parquet(
+        save_parquet_partitioned_by_year(
             ticker_data,
             config.data_dir / "silver" / "daily",
             ticker=ticker,
-            year=year,
         )
 
     # Step 3: Build gold layer
     logger.info("Step 3: Building gold layer...")
     gold = build_gold_layer(silver)
 
-    # Save gold — partitioned by ticker
+    # Save gold — partitioned by year and ticker
     for ticker in gold["ticker"].unique():
         ticker_data = gold.filter(pl.col("ticker") == ticker)
-        year = str(ticker_data["date"].min())[:4] if not ticker_data["date"].is_empty() else "unknown"
-        save_parquet(
+        save_parquet_partitioned_by_year(
             ticker_data,
             config.data_dir / "gold" / "daily",
             ticker=ticker,
-            year=year,
         )
 
     # Step 4: Create DuckDB catalog
