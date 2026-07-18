@@ -97,29 +97,28 @@ def save_parquet(
 def find_ticker_max_date(data_dir: Path, layer: str, ticker: str) -> Optional[date]:
     """Find the maximum date in parquet files for a ticker in a given layer.
 
-    Scans all year partitions under data_dir/{layer}/daily/ticker={T}/year={YYYY}/.
+    Directory structure:
+        data_dir/{layer}/daily/year={YYYY}/ticker={TICKER}/part-0.parquet
 
     Returns None if no data exists for this ticker in this layer.
     """
-    base = data_dir / layer / "daily" / f"ticker={ticker}"
+    base = data_dir / layer / "daily"
     if not base.exists():
         return None
 
     max_date = None
     for year_dir in sorted(base.glob("year=*")):
-        parquet_file = year_dir / "part-0.parquet"
+        parquet_file = year_dir / f"ticker={ticker}" / "part-0.parquet"
         if parquet_file.exists():
             try:
                 df = pl.read_parquet(str(parquet_file), columns=["date"])
                 if not df.is_empty():
-                    d = df["date"].max().to_python()
-                    if d is not None:
-                        if isinstance(d, datetime):
-                            d = d.date()
-                        if max_date is None or d > max_date:
-                            max_date = d
+                    raw = df["date"].max()
+                    if isinstance(raw, datetime):
+                        raw = raw.date()
+                    if max_date is None or raw > max_date:
+                        max_date = raw
             except Exception:
-                # Corrupt or unreadable file — treat as missing
                 continue
 
     return max_date
@@ -131,7 +130,7 @@ def should_fetch_ticker(
     start_date: date,
     end_date: date,
     force: bool = False,
-) -> tuple[bool, date]:
+) -> tuple[bool, Optional[date]]:
     """Determine whether a ticker needs fetching and compute the effective start date.
 
     Returns (should_fetch, effective_start_date).
@@ -139,7 +138,7 @@ def should_fetch_ticker(
     Logic:
     - If no bronze data exists: fetch full range
     - If data exists but is stale (max_date < end_date - threshold): incremental from existing
-    - If data is fresh (max_date >= end_date - threshold): skip
+    - If data is fresh (max_date >= end_date - threshold): skip (returns None)
     - force=True bypasses staleness checks
     """
     existing_max = find_ticker_max_date(config.data_dir, "bronze", ticker)
@@ -156,7 +155,7 @@ def should_fetch_ticker(
     cutoff = end_date - timedelta(days=STALENESS_THRESHOLD_DAYS)
     if existing_max >= cutoff:
         # Data is fresh — nothing to fetch
-        return False, end_date
+        return False, None
 
     # Data exists but is stale/incomplete — fetch incremental
     effective_start = existing_max + timedelta(days=1)
@@ -180,12 +179,12 @@ def load_bronze_from_disk(
     divs_list = []
     actions_list = []
 
+    # Daily bars: saved as bronze/daily/year={Y}/ticker={T}/part-0.parquet
     for ticker in tickers:
-        # Load daily bars
-        bar_base = config.data_dir / "bronze" / "daily" / f"ticker={ticker}"
+        bar_base = config.data_dir / "bronze" / "daily"
         if bar_base.exists():
             for year_dir in sorted(bar_base.glob("year=*")):
-                parquet_file = year_dir / "part-0.parquet"
+                parquet_file = year_dir / f"ticker={ticker}" / "part-0.parquet"
                 if parquet_file.exists():
                     try:
                         df = pl.read_parquet(str(parquet_file))
@@ -198,7 +197,8 @@ def load_bronze_from_disk(
                     except Exception:
                         continue
 
-        # Load dividends
+    # Dividends: saved as bronze/dividends/ticker={T}/part-0.parquet (no year partition)
+    for ticker in tickers:
         div_base = config.data_dir / "bronze" / "dividends" / f"ticker={ticker}"
         if div_base.exists():
             for parquet_file in sorted(div_base.glob("*.parquet")):
@@ -213,7 +213,8 @@ def load_bronze_from_disk(
                 except Exception:
                     continue
 
-        # Load corporate actions
+    # Corporate actions: saved as bronze/corporate_actions/ticker={T}/part-0.parquet
+    for ticker in tickers:
         act_base = config.data_dir / "bronze" / "corporate_actions" / f"ticker={ticker}"
         if act_base.exists():
             for parquet_file in sorted(act_base.glob("*.parquet")):
@@ -350,7 +351,8 @@ async def run_pipeline(
             config, ticker, start_date, end_date, force=force
         )
         if needs_fetch:
-            fetch_plan[ticker] = (effective_start, "incremental" if effective_start > start_date else "full")
+            label = "incremental" if effective_start and effective_start > start_date else "full"
+            fetch_plan[ticker] = (effective_start, label)
             to_fetch.append(ticker)
         else:
             skipped += 1
