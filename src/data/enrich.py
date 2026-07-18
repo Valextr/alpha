@@ -47,17 +47,6 @@ def enrich_with_sector(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
     """Add sector classification."""
-    # Build mapping expression
-    when_thens = []
-    for ticker, sector in SECTOR_MAP.items():
-        when_thens.append(pl.when(pl.col("ticker") == ticker).then(pl.lit(sector)))
-
-    sector_expr = (
-        pl.when(False).then(pl.lit("Unknown"))
-        .over([])  # Dummy to start the chain
-    )
-
-    # Simpler approach: use a join
     sector_df = pl.DataFrame({
         "ticker": list(SECTOR_MAP.keys()),
         "sector": list(SECTOR_MAP.values()),
@@ -100,22 +89,22 @@ def enrich_with_market_cap_bucket(
 
     Note: This is a simplified placeholder. In production, use actual
     market cap data from the provider. For now, use sector-based heuristics.
-    """
-    # Placeholder: assign based on known large caps
-    mega_caps = {"AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "BRK.B", "JPM"}
-    large_caps = {"TSLA", "UNH", "V", "MA", "JNJ", "XOM", "CVX", "PG", "HD", "DIS", "NFLX"}
 
-    def bucket(ticker: str) -> str:
-        if ticker in mega_caps:
-            return "mega"
-        if ticker in large_caps:
-            return "large"
-        if ticker.startswith("X") or ticker in {"SPY", "QQQ", "IWM", "DIA"}:
-            return "etf"
-        return "mid"
+    Uses vectorized when/otherwise + is_in — no row-wise Python iteration.
+    """
+    mega_caps = ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "BRK.B", "JPM"]
+    large_caps = ["TSLA", "UNH", "V", "MA", "JNJ", "XOM", "CVX", "PG", "HD", "DIS", "NFLX"]
+    etfs = ["SPY", "QQQ", "IWM", "DIA"]
 
     return df.with_columns(
-        pl.col("ticker").map_elements(bucket, return_dtype=pl.Utf8).alias("market_cap_bucket")
+        pl.when(pl.col("ticker").is_in(mega_caps))
+        .then(pl.lit("mega"))
+        .when(pl.col("ticker").is_in(large_caps))
+        .then(pl.lit("large"))
+        .when(pl.col("ticker").is_in(etfs) | pl.col("ticker").str.starts_with("X"))
+        .then(pl.lit("etf"))
+        .otherwise(pl.lit("mid"))
+        .alias("market_cap_bucket")
     )
 
 

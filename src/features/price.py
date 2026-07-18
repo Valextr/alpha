@@ -13,7 +13,9 @@ from .registry import registry
 )
 def compute_return_1d(df):
     return df.with_columns(
-        ((pl.col("close") / pl.col("close").shift(1)) - 1).alias("return_1d")
+        (
+            (pl.col("close") / pl.col("close").shift(1).over("ticker")) - 1
+        ).alias("return_1d")
     )
 
 
@@ -25,7 +27,9 @@ def compute_return_1d(df):
 )
 def compute_return_5d(df):
     return df.with_columns(
-        ((pl.col("close") / pl.col("close").shift(5)) - 1).alias("return_5d")
+        (
+            (pl.col("close") / pl.col("close").shift(5).over("ticker")) - 1
+        ).alias("return_5d")
     )
 
 
@@ -37,7 +41,9 @@ def compute_return_5d(df):
 )
 def compute_return_21d(df):
     return df.with_columns(
-        ((pl.col("close") / pl.col("close").shift(21)) - 1).alias("return_21d")
+        (
+            (pl.col("close") / pl.col("close").shift(21).over("ticker")) - 1
+        ).alias("return_21d")
     )
 
 
@@ -49,7 +55,9 @@ def compute_return_21d(df):
 )
 def compute_return_63d(df):
     return df.with_columns(
-        ((pl.col("close") / pl.col("close").shift(63)) - 1).alias("return_63d")
+        (
+            (pl.col("close") / pl.col("close").shift(63).over("ticker")) - 1
+        ).alias("return_63d")
     )
 
 
@@ -61,7 +69,11 @@ def compute_return_63d(df):
 )
 def compute_log_return_1d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(1)).log().alias("log_return_1d")
+        (
+            (pl.col("close") / pl.col("close").shift(1).over("ticker"))
+            .log()
+            .alias("log_return_1d")
+        )
     )
 
 
@@ -73,7 +85,11 @@ def compute_log_return_1d(df):
 )
 def compute_log_return_5d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(5)).log().alias("log_return_5d")
+        (
+            (pl.col("close") / pl.col("close").shift(5).over("ticker"))
+            .log()
+            .alias("log_return_5d")
+        )
     )
 
 
@@ -85,7 +101,11 @@ def compute_log_return_5d(df):
 )
 def compute_log_return_21d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(21)).log().alias("log_return_21d")
+        (
+            (pl.col("close") / pl.col("close").shift(21).over("ticker"))
+            .log()
+            .alias("log_return_21d")
+        )
     )
 
 
@@ -97,7 +117,11 @@ def compute_log_return_21d(df):
 )
 def compute_log_return_63d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(63)).log().alias("log_return_63d")
+        (
+            (pl.col("close") / pl.col("close").shift(63).over("ticker"))
+            .log()
+            .alias("log_return_63d")
+        )
     )
 
 
@@ -109,7 +133,9 @@ def compute_log_return_63d(df):
 )
 def compute_cum_return_5d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(5)).alias("cum_return_5d")
+        (pl.col("close") / pl.col("close").shift(5).over("ticker")).alias(
+            "cum_return_5d"
+        )
     )
 
 
@@ -121,7 +147,9 @@ def compute_cum_return_5d(df):
 )
 def compute_cum_return_21d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(21)).alias("cum_return_21d")
+        (pl.col("close") / pl.col("close").shift(21).over("ticker")).alias(
+            "cum_return_21d"
+        )
     )
 
 
@@ -133,7 +161,9 @@ def compute_cum_return_21d(df):
 )
 def compute_cum_return_63d(df):
     return df.with_columns(
-        (pl.col("close") / pl.col("close").shift(63)).alias("cum_return_63d")
+        (pl.col("close") / pl.col("close").shift(63).over("ticker")).alias(
+            "cum_return_63d"
+        )
     )
 
 
@@ -147,7 +177,9 @@ def compute_drawdown_from_peak(df):
     return df.with_columns(
         (
             pl.col("close")
-            / pl.col("close").rolling_max(window_size=252, min_samples=1)
+            / pl.col("close")
+            .rolling_max(window_size=252, min_samples=1)
+            .over("ticker")
             - 1
         ).alias("drawdown_from_peak")
     )
@@ -160,11 +192,9 @@ def compute_drawdown_from_peak(df):
     lookback=5,
 )
 def compute_price_displacement_5d(df):
+    shifted = pl.col("close").shift(5).over("ticker")
     return df.with_columns(
-        (
-            (pl.col("close") - pl.col("close").shift(5))
-            / pl.col("close").shift(5)
-        ).abs().alias("price_displacement_5d")
+        (((pl.col("close") - shifted) / shifted).abs()).alias("price_displacement_5d")
     )
 
 
@@ -175,11 +205,11 @@ def compute_price_displacement_5d(df):
     lookback=21,
 )
 def compute_price_displacement_21d(df):
+    shifted = pl.col("close").shift(21).over("ticker")
     return df.with_columns(
-        (
-            (pl.col("close") - pl.col("close").shift(21))
-            / pl.col("close").shift(21)
-        ).abs().alias("price_displacement_21d")
+        (((pl.col("close") - shifted) / shifted).abs()).alias(
+            "price_displacement_21d"
+        )
     )
 
 

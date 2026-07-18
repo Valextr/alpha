@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import duckdb
 
-conn = duckdb.connect("data/alpha.duckdb")
+DB_PATH = Path(__file__).resolve().parent / "data" / "alpha.duckdb"
+conn = duckdb.connect(str(DB_PATH))
 
 # Check stats
 for view in ["bronze_daily", "bronze_dividends", "silver_daily", "gold_daily", "universe_daily"]:

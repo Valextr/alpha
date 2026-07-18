@@ -46,6 +46,11 @@ def compute_features(df, categories=None):
     if df.is_empty():
         return df
 
+    # Enforce (ticker, date) sort order so that .over("ticker") rolling
+    # operations use the correct temporal ordering within each ticker group.
+    if "ticker" in df.columns and "date" in df.columns:
+        df = df.sort(["ticker", "date"])
+
     all_features = registry.list_features()
 
     if categories:

@@ -16,7 +16,9 @@ def compute_relative_volume_21d(df):
     return df.with_columns(
         (
             pl.col("volume")
-            / pl.col("volume").rolling_mean(window_size=21, min_samples=10)
+            / pl.col("volume")
+            .rolling_mean(window_size=21, min_samples=10)
+            .over("ticker")
         ).alias("relative_volume_21d")
     )
 
@@ -29,8 +31,16 @@ def compute_relative_volume_21d(df):
 )
 def compute_volume_zscore_63d(df):
     """How unusual today's volume is relative to the 63-day distribution."""
-    mean_63 = pl.col("volume").rolling_mean(window_size=63, min_samples=30)
-    std_63 = pl.col("volume").rolling_std(window_size=63, min_samples=30)
+    mean_63 = (
+        pl.col("volume")
+        .rolling_mean(window_size=63, min_samples=30)
+        .over("ticker")
+    )
+    std_63 = (
+        pl.col("volume")
+        .rolling_std(window_size=63, min_samples=30)
+        .over("ticker")
+    )
     return df.with_columns(
         ((pl.col("volume") - mean_63) / std_63.replace(0, None)).alias(
             "volume_zscore_63d"
@@ -67,8 +77,16 @@ def compute_accumulation_distribution(df):
 )
 def compute_volume_shock(df):
     """Detect unusual volume spikes (volume > mean + 2*std over 63 days)."""
-    mean_63 = pl.col("volume").rolling_mean(window_size=63, min_samples=30)
-    std_63 = pl.col("volume").rolling_std(window_size=63, min_samples=30)
+    mean_63 = (
+        pl.col("volume")
+        .rolling_mean(window_size=63, min_samples=30)
+        .over("ticker")
+    )
+    std_63 = (
+        pl.col("volume")
+        .rolling_std(window_size=63, min_samples=30)
+        .over("ticker")
+    )
     threshold = mean_63 + 2 * std_63
     return df.with_columns(
         pl.when(pl.col("volume") > threshold)
