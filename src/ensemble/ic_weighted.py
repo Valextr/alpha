@@ -56,7 +56,15 @@ def compute_cross_sectional_ic(
     cs_ic = (
         ranked.group_by("date")
         .agg(pl.corr(pl.col("_rank_s"), pl.col("_rank_t")).alias("cs_ic"))
-        .drop_nulls()
+    )
+
+    # With one ticker per date, correlation is NaN — drop those rows
+    cs_ic = cs_ic.filter(pl.col("cs_ic").is_not_nan())
+
+    # Clip to [-1, +1] to handle floating-point edge cases with
+    # very small cross-sections (e.g., only 3 tickers per date).
+    cs_ic = cs_ic.with_columns(
+        pl.col("cs_ic").clip(lower_bound=-1.0, upper_bound=1.0)
     )
 
     return cs_ic.select(["date", "cs_ic"])
@@ -137,7 +145,11 @@ def ic_to_weights(
 
     if method == "abs_ic":
         abs_ics = {k: abs(v) for k, v in ic_values.items()}
-        total = sum(abs_ics.values()) or 1.0
+        total = sum(abs_ics.values())
+        if total == 0.0:
+            # All ICs are zero — fall back to equal weight
+            n = len(ic_values) or 1
+            return {k: 1.0 / n for k in ic_values}
         return {k: v / total for k, v in abs_ics.items()}
 
     if method == "rank_ic":
@@ -148,8 +160,12 @@ def ic_to_weights(
 
     if method == "positive_ic":
         pos_ics = {k: max(v, 0.0) for k, v in ic_values.items()}
-        total = sum(pos_ics.values()) or 1.0
-        return {k: v / total for k, v in pos_ics.items()}
+        total = sum(pos_ics.values())
+        if total > 0:
+            return {k: v / total for k, v in pos_ics.items()}
+        # Fallback to equal weights when all ICs are non-positive
+        n = len(ic_values) or 1
+        return {k: 1.0 / n for k in ic_values}
 
     # Default fallback: equal weight
     n = len(ic_values) or 1
@@ -239,8 +255,10 @@ class ICWeightedEnsemble:
         for sig in signal_cols:
             wcol = f"w_{sig}"
             if wcol in filled.columns:
+                # Forward-fill from first rebalance, then backfill for
+                # dates before the first rebalance (early period).
                 filled = filled.with_columns(
-                    pl.col(wcol).forward_fill().fill_null(default_w)
+                    pl.col(wcol).forward_fill().backward_fill().fill_null(default_w)
                 )
 
         return filled
@@ -288,7 +306,7 @@ class ICWeightedEnsemble:
         # Merge into wide format
         ic_wide = ic_parts[0]
         for part in ic_parts[1:]:
-            ic_wide = ic_wide.join(part, on="date", how="outer_coalesce")
+            ic_wide = ic_wide.join(part, on="date", how="full", coalesce=True)
 
         # 2. Build weight schedule
         all_dates = sorted(df["date"].unique().to_list())
