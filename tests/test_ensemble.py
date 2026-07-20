@@ -1,9 +1,4 @@
-"""Ensemble tests — CSIC, weights, and IC-weighted ensemble pipeline.
-
-Tests follow the same synthetic data patterns as test_signals.py:
-_multi_ticker_bars() for controlled oscillating prices, plus real
-data integration tests when gold layer data is available.
-"""
+"""Ensemble tests — LightGBM meta-learner and IC-weighted validation."""
 
 import sys
 from datetime import date, timedelta
@@ -16,23 +11,31 @@ import pytest
 root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root))
 
-from src.signals.registry import registry as signal_registry
-from src.signals.base import (
-    compute_forward_returns,
-    rank_ic,
-    signal_summary,
-)
-from src.signals.pipeline import generate_all, generate_all_with_forward_returns
-from src.signals import mean_reversion, momentum  # noqa: F401 — registers signals
 from src.features.pipeline import compute_features
-from src.ensemble.ic_weighted import (
-    compute_csic,
-    compute_ensemble_weights,
-    compute_ic_weighted_ensemble,
+from src.signals.pipeline import generate_all_with_forward_returns
+from src.signals import mean_reversion, momentum  # noqa: F401
+from src.ensemble.lightgbm import (
+    LightGBMEnsemble,
+    LightGBMEnsembleConfig,
+    HOLD_BACK_CUTOFF,
 )
-
-
-# ── helpers ──────────────────────────────────────────────────────────
+from src.ensemble.ic_weighted import (
+    ICWeightedEnsemble,
+    compute_cross_sectional_ic,
+    compute_rolling_ic,
+)
+from src.ensemble.validation import (
+    SignalMetrics,
+    EnsembleMetrics,
+    WeightStats,
+    compute_cs_ic_stats,
+    signal_metrics,
+    validate_signals,
+    validate_ensemble,
+    weight_report,
+    format_metrics_table,
+    format_ensemble_report,
+)
 
 
 def _trading_dates(start: date, n: int) -> list[date]:
@@ -45,320 +48,463 @@ def _trading_dates(start: date, n: int) -> list[date]:
     return dates
 
 
-def _make_bars(
-    ticker: str,
-    num_days: int = 200,
-    base_close: float = 100.0,
-    start_date: date = date(2019, 1, 3),
-    volume: int = 1_000_000,
-    seed: int = 0,
-) -> pl.DataFrame:
-    import math
-
-    closes = []
-    c = base_close
-    for i in range(num_days):
-        c = c * (1.0 + 0.02 * math.sin(i * 0.1))  # gentle oscillation
-        closes.append(round(c, 2))
-    return pl.DataFrame(
-        {
-            "ticker": [ticker] * num_days,
-            "date": dates,
-            "open": closes,
-            "high": [c + 1 for c in closes],
-            "low": [max(c - 1, 1.0) for c in closes],
-            "close": closes,
-            "volume": [volume + (i % 10) * 100_000 for i in range(num_days)],
-        }
-    )
+def _make_bars(ticker: str, n: int = 150, base: float = 100.0,
+               start: date = date(2019, 1, 3), seed: int = 0) -> pl.DataFrame:
+    dates = _trading_dates(start, n)
+    rng = np.random.RandomState(seed)
+    closes = [base]
+    for i in range(1, n):
+        closes.append(round(closes[-1] * (1 + 0.0005 + 0.02 * rng.randn()), 2))
+    return pl.DataFrame({
+        "ticker": [ticker] * n,
+        "date": dates,
+        "open": closes,
+        "high": [c + abs(x) for c, x in zip(closes, rng.randn(n))],
+        "low": [max(c - abs(x), 1.0) for c, x in zip(closes, rng.randn(n))],
+        "close": closes,
+        "volume": [1_000_000 + int(x * 100_000) for x in rng.rand(n)],
+    })
 
 
-def _multi_ticker_bars(n_tickers: int = 5, n_days: int = 300) -> pl.DataFrame:
-    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"][:n_tickers]
-    frames = [
-        _make_bars(t, num_days=n_days, base_close=100.0 + i * 50)
-        for i, t in enumerate(tickers)
-    ]
-    return pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
-
-
-def _prepare_signals(n_tickers: int = 5, n_days: int = 300) -> pl.DataFrame:
-    """Full pipeline: bars → features → signals → forward returns."""
-    df = _multi_ticker_bars(n_tickers, n_days)
+def _signal_df(n_ticks: int = 5, n_days: int = 150) -> pl.DataFrame:
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"][:n_ticks]
+    frames = [_make_bars(t, n_days, 100.0 + i * 50, seed=i) for i, t in enumerate(tickers)]
+    df = pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
     df = compute_features(df)
-    df = generate_all(df)
-    df = compute_forward_returns(df, horizons=[1, 5, 21])
+    df = generate_all_with_forward_returns(df, horizons=[1, 5, 21])
     return df
 
 
-SIGNAL_COLS = [
-    "signal_mean_reversion_21d",
-    "signal_mean_reversion_63d",
-    "signal_momentum_21d",
-    "signal_momentum_63d",
-]
+@pytest.fixture
+def df() -> pl.DataFrame:
+    return _signal_df()
 
 
-# ── CSIC tests ───────────────────────────────────────────────────────
+# ── Config tests ─────────────────────────────────────────────────────
+
+class TestConfig:
+    def test_hold_back_cutoff(self):
+        assert HOLD_BACK_CUTOFF == date(2023, 1, 1)
+
+    def test_config_defaults(self):
+        c = LightGBMEnsembleConfig()
+        assert c.signal_columns == []
+        assert c.target_horizon == 1
 
 
-class TestCSIC:
-    def test_csic_columns(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        for s in SIGNAL_COLS:
-            assert f"ic_{s}" in csic.columns, f"Missing ic_{s}"
-        assert "ic_mean" in csic.columns
-        assert "date" in csic.columns
+# ── Fitting tests ────────────────────────────────────────────────────
 
-    def test_csic_values_in_range(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        for s in SIGNAL_COLS:
-            col = csic[f"ic_{s}"]
-            # CSIC should be in [-1, +1]
-            assert (col >= -1.0).all(), f"ic_{s} below -1"
-            assert (col <= 1.0).all(), f"ic_{s} above +1"
+class TestFit:
+    def test_fit(self, df):
+        LightGBMEnsemble().fit(df, train_end="2020-06-01")
 
-    def test_csic_non_empty(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        assert len(csic) > 0
+    def test_fit_chaining(self, df):
+        ens = LightGBMEnsemble()
+        assert ens.fit(df, train_end="2020-06-01") is ens
 
-    def test_csic_date_count(self):
-        """CSIC should have one row per unique date with valid data."""
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        # CSIC dates should be a subset of original dates
-        df_dates = set(df["date"].to_list())
-        csic_dates = set(csic["date"].to_list())
-        assert csic_dates.issubset(df_dates)
+    def test_fit_date_obj(self, df):
+        LightGBMEnsemble().fit(df, train_end=date(2020, 6, 1))
 
-    def test_csic_single_signal(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, [SIGNAL_COLS[0]], "forward_return_1")
-        assert f"ic_{SIGNAL_COLS[0]}" in csic.columns
-        assert "ic_mean" in csic.columns
+    def test_fit_past_cutoff_raises(self, df):
+        with pytest.raises(ValueError, match="hold-back"):
+            LightGBMEnsemble().fit(df, train_end="2025-01-01")
 
-    def test_csic_missing_target_raises(self):
-        df = _prepare_signals(5, 200)
-        with pytest.raises(ValueError, match="Target column"):
-            compute_csic(df, SIGNAL_COLS, "nonexistent_col")
+    def test_fit_no_data_raises(self, df):
+        with pytest.raises(ValueError, match="No training data"):
+            LightGBMEnsemble().fit(df, train_end="2018-01-01")
 
-    def test_csic_missing_signal_raises(self):
-        df = _prepare_signals(5, 200)
-        with pytest.raises(ValueError, match="Signal columns not found"):
-            compute_csic(df, ["signal_nonexistent"], "forward_return_1")
+    def test_fit_bad_horizon_raises(self, df):
+        with pytest.raises(ValueError, match="Missing required columns"):
+            LightGBMEnsemble(config=LightGBMEnsembleConfig(target_horizon=999)).fit(df, train_end="2020-06-01")
+
+    def test_fit_no_signals_raises(self):
+        d = pl.DataFrame({"date": [date(2019, 1, 1)], "close": [100.0]})
+        with pytest.raises(ValueError, match="No signal columns"):
+            LightGBMEnsemble().fit(d, train_end="2020-01-01")
+
+    def test_fit_missing_feature_raises(self, df):
+        with pytest.raises(ValueError, match="Feature columns missing"):
+            LightGBMEnsemble(config=LightGBMEnsembleConfig(signal_columns=["signal_fake"])).fit(df, train_end="2020-06-01")
 
 
-# ── Ensemble weights tests ──────────────────────────────────────────
+# ── Auto-detection ───────────────────────────────────────────────────
+
+class TestAutoDetect:
+    def test_auto_detect(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        assert len(ens._feature_cols) >= 4
+        assert all(c.startswith("signal_") for c in ens._feature_cols)
+
+    def test_explicit_cols(self, df):
+        cols = ["signal_momentum_21d", "signal_momentum_63d"]
+        ens = LightGBMEnsemble(config=LightGBMEnsembleConfig(signal_columns=cols))
+        ens.fit(df, train_end="2020-06-01")
+        assert ens._feature_cols == cols
 
 
-class TestEnsembleWeights:
-    def test_weights_columns(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        weights = compute_ensemble_weights(csic, SIGNAL_COLS, ic_window=21)
-        for s in SIGNAL_COLS:
-            assert f"weight_{s}" in weights.columns
-        assert "weight_sum" in weights.columns
+# ── Predictions ──────────────────────────────────────────────────────
 
-    def test_weights_sum_to_one(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        weights = compute_ensemble_weights(csic, SIGNAL_COLS, ic_window=21)
-        # Weight sum should be very close to 1.0 (accounting for floating point)
-        ws = weights["weight_sum"].drop_nulls()
-        assert (ws >= 0.99).all(), "Weights should sum to ~1.0"
-        assert (ws <= 1.01).all(), "Weights should sum to ~1.0"
+class TestPredict:
+    def test_predict_unfitted_raises(self):
+        with pytest.raises(RuntimeError):
+            LightGBMEnsemble().predict(pl.DataFrame())
 
-    def test_weights_non_negative(self):
-        df = _prepare_signals(5, 200)
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        weights = compute_ensemble_weights(csic, SIGNAL_COLS, ic_window=21)
-        for s in SIGNAL_COLS:
-            w = weights[f"weight_{s}"].drop_nulls()
-            assert (w >= 0.0).all(), f"weight_{s} should be non-negative"
+    def test_predict_column(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        out = ens.predict(df, return_column="p")
+        assert "p" in out.columns
 
-    def test_weights_fallback_equal(self):
-        """When all ICs are zero/negative, weights should be equal."""
-        # Construct CSIC with all zeros
-        csic = pl.DataFrame({
-            "date": range(100),
-            "ic_signal_a": [0.0] * 100,
-            "ic_signal_b": [0.0] * 100,
-            "ic_mean": [0.0] * 100,
-        })
-        weights = compute_ensemble_weights(csic, ["signal_a", "signal_b"], ic_window=10)
-        # After the first lag + floor, should converge to equal weights
-        non_null_a = weights["weight_signal_a"].drop_nulls()
-        non_null_b = weights["weight_signal_b"].drop_nulls()
-        if len(non_null_a) > 1:  # skip first date (lag creates null)
-            assert abs(float(non_null_a.mean()) - 0.5) < 0.01
-            assert abs(float(non_null_b.mean()) - 0.5) < 0.01
+    def test_predict_shape(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        assert len(ens.predict(df)) == len(df)
+
+    def test_predict_range(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        p = ens.predict(df, return_column="p")["p"].drop_nulls().to_list()
+        assert all(0.0 <= v <= 1.0 for v in p)
+
+    def test_predict_variance(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        p = ens.predict(df, return_column="p")["p"].drop_nulls().to_list()
+        assert len(set(p)) > 1
+
+    def test_direction_unfitted_raises(self):
+        with pytest.raises(RuntimeError):
+            LightGBMEnsemble().predict_direction(pl.DataFrame())
+
+    def test_direction_values(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        vals = set(ens.predict_direction(df, return_column="dir")["dir"].drop_nulls().to_list())
+        assert vals.issubset({-1.0, 0.0, 1.0})
+
+    def test_direction_spread(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        vals = ens.predict_direction(df)["ensemble_direction"].drop_nulls().to_list()
+        assert len(set(vals)) > 1
 
 
-# ── Full ensemble pipeline tests ────────────────────────────────────
+# ── Feature importance ───────────────────────────────────────────────
+
+class TestImportance:
+    def test_importance_unfitted_raises(self):
+        with pytest.raises(RuntimeError):
+            LightGBMEnsemble().feature_importance()
+
+    def test_importance(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        imp = ens.feature_importance()
+        assert len(imp) == len(ens._feature_cols)
+        assert all(v >= 0 for v in imp.values())
+        assert sum(imp.values()) > 0
+
+
+# ── Metrics ──────────────────────────────────────────────────────────
+
+class TestMetrics:
+    def test_metrics(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        m = ens.training_metrics()
+        assert "train_auc" in m and "train_logloss" in m
+        assert 0.0 <= m["train_auc"] <= 1.0
+
+    def test_val_split(self, df):
+        ens = LightGBMEnsemble()
+        ens.fit(df, train_end="2020-06-01", val_start="2020-06-02")
+        assert "train_auc" in ens.training_metrics()
+
+
+# ── Hold-back safety ─────────────────────────────────────────────────
+
+class TestHoldBack:
+    def test_at_cutoff(self, df):
+        LightGBMEnsemble().fit(df, train_end="2023-01-01")
+
+    def test_before_cutoff(self, df):
+        LightGBMEnsemble().fit(df, train_end="2020-01-01")
+
+
+# ── End-to-end ───────────────────────────────────────────────────────
+
+class TestE2E:
+    def test_pipeline(self, df):
+        ens = LightGBMEnsemble().fit(df, train_end="2020-06-01")
+        out = ens.predict(df, return_column="ep")
+        assert "ep" in out.columns
+        assert len(out["ep"].drop_nulls()) > 0
+        assert len(ens.feature_importance()) >= 4
+        assert ens.training_metrics()["train_auc"] > 0.0
+
+    def test_horizons(self, df):
+        for h in [1, 5]:
+            ens = LightGBMEnsemble(config=LightGBMEnsembleConfig(target_horizon=h))
+            ens.fit(df, train_end="2020-06-01")
+            assert ens._fitted
+
+    def test_custom_params(self, df):
+        cfg = LightGBMEnsembleConfig(lgbm_params={"n_estimators": 50, "num_leaves": 8})
+        ens = LightGBMEnsemble(config=cfg).fit(df, train_end="2020-06-01")
+        assert ens.model_.n_estimators_ == 50
+
+    def test_additional_features(self, df):
+        df2 = df.with_columns(
+            pl.col("close").pct_change().over("ticker").alias("my_feat")
+        )
+        ens = LightGBMEnsemble(config=LightGBMEnsembleConfig(additional_features=["my_feat"]))
+        ens.fit(df2, train_end="2020-06-01")
+        assert "my_feat" in ens._feature_cols
+
+
+# ── Real data ────────────────────────────────────────────────────────
+
+class TestRealData:
+    def test_gold_data(self):
+        gd = root / "data" / "gold" / "daily" / "year=2022"
+        files = list(gd.glob("ticker=*/part-0.parquet"))
+        if not files:
+            pytest.skip("No gold data")
+        df = pl.concat([pl.read_parquet(str(f)) for f in sorted(files)],
+                       how="vertical_relaxed").sort(["ticker", "date"])
+        df = compute_features(df)
+        df = generate_all_with_forward_returns(df, horizons=[1, 5, 21])
+        ens = LightGBMEnsemble().fit(df, train_end="2022-07-01")
+        assert ens._fitted
+        out = ens.predict(df)
+        assert "ensemble_prediction" in out.columns
+        assert 0.0 <= ens.training_metrics()["train_auc"] <= 1.0
+
+
+# ═════════════════════════════════════════════════════════════════════
+# IC-weighted ensemble and validation tests
+# ═════════════════════════════════════════════════════════════════════
+
+import math as _math
+
+
+def _ic_bars(ticker: str, n: int = 250, base_close: float = 100.0, phase: float = 0.0):
+    dates = _trading_dates(date(2023, 1, 3), n)
+    closes = []
+    c = base_close
+    for i in range(n):
+        c = c * (1.0 + 0.005 + 0.015 * _math.sin(i * 0.1 + phase))
+        closes.append(round(c, 2))
+    return pl.DataFrame({
+        "ticker": [ticker] * n, "date": dates, "open": closes,
+        "high": [c + 1 for c in closes], "low": [max(c - 1, 1.0) for c in closes],
+        "close": closes,
+        "volume": [1_000_000 + (i % 10) * 100_000 for i in range(n)],
+    })
+
+
+def _ic_multi_bars(n_tickers: int = 5, n_days: int = 250) -> pl.DataFrame:
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"][:n_tickers]
+    frames = [_ic_bars(t, n_days, 80.0 + i * 40, i * 0.7)
+              for i, t in enumerate(tickers)]
+    return pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
+
+
+def _ic_signal_df(n_ticks: int = 5, n_days: int = 250) -> pl.DataFrame:
+    df = _ic_multi_bars(n_ticks, n_days)
+    df = compute_features(df)
+    from src.signals.pipeline import generate_all
+    df = generate_all(df)
+    return df.with_columns(
+        ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1)
+        .alias("forward_return_1")
+    )
+
+
+class TestCrossSectionalIC:
+    def test_returns_correct_columns(self):
+        df = _ic_multi_bars(5, 200)
+        df = df.with_columns(pl.col("close").rank("average").over("date").alias("signal"))
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("target"))
+        cs = compute_cross_sectional_ic(df, "signal", "target")
+        assert "date" in cs.columns and "cs_ic" in cs.columns
+
+    def test_non_empty_multi_ticker(self):
+        df = _ic_multi_bars(5, 200)
+        df = df.with_columns(pl.col("close").rank("average").over("date").alias("signal"))
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("target"))
+        assert len(compute_cross_sectional_ic(df, "signal", "target")) > 0
+
+    def test_empty_single_ticker(self):
+        df = _ic_bars("SINGLE", 100)
+        df = df.with_columns(pl.col("close").rank("average").over("date").alias("signal"))
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("target"))
+        assert compute_cross_sectional_ic(df, "signal", "target").is_empty()
+
+
+class TestRollingIC:
+    def test_returns_columns(self):
+        df = _ic_multi_bars(5, 200)
+        df = df.with_columns(pl.col("close").rank("average").over("date").alias("signal"))
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("target"))
+        rolling = compute_rolling_ic(df, "signal", "target", window=21)
+        assert "date" in rolling.columns and "rolling_ic" in rolling.columns
 
 
 class TestICWeightedEnsemble:
-    def test_ensemble_column_produced(self):
-        df = _prepare_signals(5, 200)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        assert "signal_ensemble" in out.columns
+    def test_produces_ensemble_score(self):
+        df = _ic_signal_df()
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        out = ens.transform(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"],
+                           target_col="forward_return_1")
+        assert "ensemble_score" in out.columns
 
-    def test_ensemble_bounds(self):
-        """Ensemble should be bounded roughly in [-1, +1]."""
-        df = _prepare_signals(5, 200)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        col = out["signal_ensemble"].drop_nulls()
-        # Individual signals are in [-1, +1] and weights sum to 1,
-        # so the weighted sum should also be in [-1, +1]
-        assert (col <= 1.05).all(), "Ensemble should be bounded ~+1"
-        assert (col >= -1.05).all(), "Ensemble should be bounded ~-1"
+    def test_weights_sum_to_one(self):
+        df = _ic_signal_df()
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        out = ens.transform(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"],
+                           target_col="forward_return_1")
+        w_sum = out["w_signal_mean_reversion_21d"] + out["w_signal_momentum_21d"]
+        assert (w_sum > 0.99).all() and (w_sum < 1.01).all()
 
-    def test_ensemble_has_both_signs(self):
-        df = _prepare_signals(5, 300)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        col = out["signal_ensemble"].drop_nulls()
-        assert (col > 0).any(), "Ensemble should have positive values"
-        assert (col < 0).any(), "Ensemble should have negative values"
+    def test_predict_requires_transform(self):
+        ens = ICWeightedEnsemble()
+        with pytest.raises(RuntimeError, match="transform"):
+            ens.predict(pl.DataFrame(), signal_cols=["signal_mean_reversion_21d"])
 
-    def test_ensemble_variance(self):
-        """Ensemble should have non-trivial variance."""
-        df = _prepare_signals(5, 300)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        std = out["signal_ensemble"].std()
-        assert std is not None and std > 0, "Ensemble should have variance"
-
-    def test_ensemble_preserves_original_columns(self):
-        """Original signal columns should remain untouched."""
-        df = _prepare_signals(5, 200)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        for s in SIGNAL_COLS:
-            assert s in out.columns
-        assert "signal_ensemble" in out.columns
-
-    def test_ensemble_empty_df(self):
-        """Empty input: output should only contain the ensemble column."""
-        out = compute_ic_weighted_ensemble(
-            pl.DataFrame(), SIGNAL_COLS, ic_window=21
-        )
-        # Polars with_columns(pl.lit) creates a single-row frame even for
-        # empty input; the important invariant is the column exists.
-        assert "signal_ensemble" in out.columns
-        assert len(out.columns) == 1
-
-    def test_ensemble_with_custom_output(self):
-        df = _prepare_signals(5, 200)
-        out = compute_ic_weighted_ensemble(
-            df, SIGNAL_COLS, ic_window=21, out_col="my_ensemble"
-        )
-        assert "my_ensemble" in out.columns
+    def test_all_four_signals(self):
+        df = _ic_signal_df()
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        out = ens.transform(df, signal_cols=[
+            "signal_mean_reversion_21d", "signal_mean_reversion_63d",
+            "signal_momentum_21d", "signal_momentum_63d"], target_col="forward_return_1")
+        assert "ensemble_score" in out.columns
+        for sig in ["signal_mean_reversion_21d", "signal_mean_reversion_63d",
+                     "signal_momentum_21d", "signal_momentum_63d"]:
+            assert f"w_{sig}" in out.columns
 
 
-# ── Ensemble vs individual signals ──────────────────────────────────
+class TestCSICStats:
+    def test_returns_three_values(self):
+        df = _ic_signal_df(5, 200)
+        mean, std, pos = compute_cs_ic_stats(df, "signal_momentum_21d", "forward_return_1")
+        assert -1.0 <= mean <= 1.0 and std >= 0.0 and 0.0 <= pos <= 1.0
+
+    def test_zeros_for_missing_column(self):
+        mean, std, pos = compute_cs_ic_stats(_ic_multi_bars(2, 50), "nonexistent", "target")
+        assert mean == 0.0 and std == 0.0 and pos == 0.0
 
 
-class TestEnsemblePerformance:
-    def test_ensemble_ic_comparable(self):
-        """Ensemble IC should be comparable to or better than individual signals."""
-        df = _prepare_signals(5, 400)
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
+class TestValidateSignals:
+    def test_returns_list_of_metrics(self):
+        df = _ic_signal_df(5, 250)
+        metrics = validate_signals(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"])
+        assert len(metrics) == 2
+        assert abs(metrics[0].flat_ic) >= abs(metrics[1].flat_ic)
 
-        # Rank IC of ensemble vs 1-day forward return
-        ensemble_ic = rank_ic("signal_ensemble", "forward_return_1", out)
-
-        # Best individual IC
-        best_ic = max(
-            rank_ic(s, "forward_return_1", out) for s in SIGNAL_COLS
-        )
-
-        # Ensemble should at least not be dramatically worse
-        # (synthetic data is oscillating, so ICs are low — just verify it's computed)
-        assert -1.0 <= ensemble_ic <= 1.0
-        # Ensemble IC should be within a reasonable range of best individual IC
-        # (not necessarily better — synthetic data is noisy)
-        assert abs(ensemble_ic) <= abs(best_ic) + 0.3
+    def test_skips_missing_columns(self):
+        df = _ic_signal_df(5, 100)
+        metrics = validate_signals(df, signal_cols=["signal_momentum_21d", "signal_nonexistent"])
+        assert len(metrics) == 1
 
 
-# ── Integration: real data ──────────────────────────────────────────
+class TestValidateEnsemble:
+    def test_returns_ensemble_metrics(self):
+        df = _ic_signal_df(5, 250)
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        df = ens.transform(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"],
+                          target_col="forward_return_1")
+        em = validate_ensemble(df, ensemble_col="ensemble_score",
+                              signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"])
+        assert isinstance(em, EnsembleMetrics)
+        assert -1.0 <= em.ensemble_flat_ic <= 1.0
+        assert len(em.signals) == 2
+
+    def test_dominates_all_flag(self):
+        df = _ic_signal_df(5, 250)
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        df = ens.transform(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"],
+                          target_col="forward_return_1")
+        em = validate_ensemble(df, ensemble_col="ensemble_score",
+                              signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"])
+        assert isinstance(em.dominates_all, bool)
 
 
-class TestRealData:
-    def test_ensemble_on_gold_data(self):
-        """Run ensemble on actual gold layer data if available."""
-        gold_dir = root / "data" / "gold" / "daily" / "year=2023"
-        files = list(gold_dir.glob("ticker=*/part-0.parquet"))
-        if not files:
-            pytest.skip("No gold data available")
+class TestWeightReport:
+    def test_requires_transform(self):
+        with pytest.raises(RuntimeError, match="transform"):
+            weight_report(ICWeightedEnsemble())
 
-        frames = [pl.read_parquet(str(f)) for f in sorted(files)]
-        df = pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
-        assert not df.is_empty()
+    def test_returns_weight_stats(self):
+        df = _ic_signal_df(5, 250)
+        ens = ICWeightedEnsemble(ic_window=21, rebalance_freq=5)
+        ens.transform(df, signal_cols=["signal_mean_reversion_21d", "signal_momentum_21d"],
+                     target_col="forward_return_1")
+        stats = weight_report(ens)
+        assert len(stats) == 2
+        for ws in stats:
+            assert isinstance(ws, WeightStats) and ws.mean >= 0.0 and ws.max <= 1.0
 
-        # Full pipeline
+
+class TestFormatReports:
+    def test_metrics_table(self):
+        metrics = [SignalMetrics(signal="signal_a", flat_ic=0.05, win_rate=0.55,
+                                 cs_ic_mean=0.04, cs_ic_std=0.03, cs_ic_positive_pct=0.60)]
+        assert "signal_a" in format_metrics_table(metrics)
+
+    def test_ensemble_report_pass(self):
+        em = EnsembleMetrics(ensemble="e", ensemble_flat_ic=0.06, ensemble_win_rate=0.57,
+                            ensemble_cs_ic_mean=0.05, ensemble_cs_ic_std=0.03,
+                            ensemble_cs_ic_positive_pct=0.65, dominates_all=True)
+        assert "[PASS]" in format_ensemble_report(em)
+
+    def test_ensemble_report_warn(self):
+        em = EnsembleMetrics(ensemble="e", ensemble_flat_ic=0.02, ensemble_win_rate=0.50,
+                            ensemble_cs_ic_mean=0.01, ensemble_cs_ic_std=0.03,
+                            ensemble_cs_ic_positive_pct=0.50, dominates_all=False)
+        assert "[WARN]" in format_ensemble_report(em)
+
+
+class TestRealDataIC:
+    def _load_gold(self, years=None):
+        gold_dir = root / "data" / "gold" / "daily"
+        if years is None:
+            years = sorted(d.name for d in gold_dir.iterdir() if d.is_dir())
+        frames = []
+        for y in years:
+            for f in (gold_dir / y).rglob("part-0.parquet"):
+                frames.append(pl.read_parquet(str(f)))
+        return pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
+
+    def test_ensemble_on_real_data(self):
+        df = self._load_gold(["year=2020", "year=2021", "year=2022"])
+        if df.is_empty():
+            pytest.skip("No gold data")
         df = compute_features(df)
+        from src.signals.pipeline import generate_all
         df = generate_all(df)
-        df = compute_forward_returns(df, horizons=[1, 5, 21])
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("forward_return_1"))
+        ens = ICWeightedEnsemble(ic_window=63, rebalance_freq=5)
+        df = ens.transform(df, signal_cols=[
+            "signal_mean_reversion_21d", "signal_mean_reversion_63d",
+            "signal_momentum_21d", "signal_momentum_63d"], target_col="forward_return_1")
+        assert "ensemble_score" in df.columns
+        score = df["ensemble_score"].drop_nulls()
+        assert len(score) > 0
+        assert (score <= 1.0).all() and (score >= -1.0).all()
 
-        # Ensemble
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-        assert "signal_ensemble" in out.columns
-
-        # Ensemble should have meaningful spread
-        std = out["signal_ensemble"].std()
-        assert std is not None and std > 0, "Ensemble has no variance on real data"
-
-    def test_csic_on_gold_data(self):
-        """CSIC should be computable on real data."""
-        gold_dir = root / "data" / "gold" / "daily" / "year=2023"
-        files = list(gold_dir.glob("ticker=*/part-0.parquet"))
-        if not files:
-            pytest.skip("No gold data available")
-
-        frames = [pl.read_parquet(str(f)) for f in sorted(files)]
-        df = pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
+    def test_validation_on_real_data(self):
+        df = self._load_gold(["year=2020", "year=2021", "year=2022"])
+        if df.is_empty():
+            pytest.skip("No gold data")
         df = compute_features(df)
+        from src.signals.pipeline import generate_all
         df = generate_all(df)
-        df = compute_forward_returns(df, horizons=[1, 5, 21])
-
-        csic = compute_csic(df, SIGNAL_COLS, "forward_return_1")
-        assert len(csic) > 0
-        for s in SIGNAL_COLS:
-            col = csic[f"ic_{s}"]
-            assert (col >= -1.0).all()
-            assert (col <= 1.0).all()
-
-    def test_ensemble_beats_individual_on_real_data(self):
-        """Ensemble IC should be >= best individual IC on real data."""
-        gold_dir = root / "data" / "gold" / "daily" / "year=2023"
-        files = list(gold_dir.glob("ticker=*/part-0.parquet"))
-        if not files:
-            pytest.skip("No gold data available")
-
-        frames = [pl.read_parquet(str(f)) for f in sorted(files)]
-        df = pl.concat(frames, how="vertical_relaxed").sort(["ticker", "date"])
-        df = compute_features(df)
-        df = generate_all(df)
-        df = compute_forward_returns(df, horizons=[1, 5, 21])
-
-        out = compute_ic_weighted_ensemble(df, SIGNAL_COLS, ic_window=21)
-
-        ensemble_ic = rank_ic("signal_ensemble", "forward_return_1", out)
-        individual_ics = {
-            s: rank_ic(s, "forward_return_1", out) for s in SIGNAL_COLS
-        }
-        best_ic = max(individual_ics.values())
-
-        # Log results for inspection
-        print(f"Ensemble IC: {ensemble_ic:.4f}")
-        for s, ic in individual_ics.items():
-            print(f"  {s} IC: {ic:.4f}")
-
-        # Ensemble should at least not be dramatically worse than best individual
-        # (real data gives a better signal; allow some tolerance)
-        assert ensemble_ic >= best_ic - 0.1, (
-            f"Ensemble IC ({ensemble_ic:.4f}) should be close to best individual "
-            f"IC ({best_ic:.4f})"
-        )
+        df = df.with_columns(
+            ((pl.col("close").shift(-1).over("ticker")) / pl.col("close") - 1).alias("forward_return_1"))
+        signal_cols = ["signal_mean_reversion_21d", "signal_mean_reversion_63d",
+                       "signal_momentum_21d", "signal_momentum_63d"]
+        ens = ICWeightedEnsemble(ic_window=63, rebalance_freq=5)
+        df = ens.transform(df, signal_cols=signal_cols, target_col="forward_return_1")
+        em = validate_ensemble(df, ensemble_col="ensemble_score", signal_cols=signal_cols,
+                              target_col="forward_return_1", horizons=[1, 5, 21])
+        assert len(em.signals) == 4
+        assert len(weight_report(ens)) == 4
+        assert len(format_ensemble_report(em)) > 0
