@@ -64,7 +64,7 @@ class PolygonDataSource(DataSource):
             request_delay: Minimum seconds between API calls
         """
         self._api_key = api_key
-        self._client = RESTClient(api_key, wrap_exception=True)
+        self._client = RESTClient(api_key)
         self._rate_limit_rps = rate_limit_rps
         self._request_delay = request_delay
         self._request_times: list[float] = []
