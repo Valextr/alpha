@@ -58,13 +58,13 @@ class TestAdjustForSplits:
         after = result.filter(pl.col("date") > split_date)
 
         # Original closes were 100, 101, ... (60 bars from Jan 3)
-        # Split is on Feb 15 (~row 27, close ~127)
-        # Before split: halved (50.0, 50.5, ..., ~63.5)
-        # After split: unchanged (starts from ~128)
+        # Split is on Feb 15 (~row 31, close ~131)
+        # Before split: halved (50.0, 50.5, ..., ~65.5)
+        # After split: unchanged (starts from ~132)
         before_max = float(before["close"].max())
         after_min = float(after["close"].min())
-        # Before should be roughly half of original max before split
-        assert before_max == pytest.approx(63.5, abs=1.0)
+        # Before should be roughly half of original max before split (~65.5)
+        assert before_max == pytest.approx(65.5, abs=0.5)
         # After should be > 100 (not halved)
         assert after_min > 100
 
@@ -172,9 +172,11 @@ class TestBuildSilverLayer:
             }
         )
         silver = build_silver_layer(single_ticker_bars, dividends_empty, actions)
-        # adj_close before split should be halved
+        # adj_close before split should be halved (max ~65.5)
         before = silver.filter(pl.col("date") <= date(2023, 2, 15))
-        assert float(before["adj_close"].max()) == pytest.approx(53.0, abs=0.5)
+        before_max = float(before["adj_close"].max())
+        # Should be roughly half of 131 (the original close on split date)
+        assert before_max == pytest.approx(65.5, abs=0.5)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
