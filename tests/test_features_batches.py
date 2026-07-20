@@ -55,7 +55,6 @@ def test_registry():
     assert not missing, f"Missing dependencies: {missing}"
 
     print("\nRegistry: OK")
-    return True
 
 
 def test_volume_features():
@@ -82,7 +81,6 @@ def test_volume_features():
     print(f"Output cols: {len(enriched.columns)} (+{len(expected_cols)} volume features)")
     print(f"Validation: {validation}")
     print("Volume: OK")
-    return enriched
 
 
 def test_cross_sectional_features(df=None):
@@ -118,7 +116,6 @@ def test_cross_sectional_features(df=None):
     print(f"Output cols: {len(enriched.columns)} (+5 cross-sectional)")
     print(f"Validation: {validation}")
     print("Cross-Sectional: OK")
-    return enriched
 
 
 def test_regime_features(df=None):
@@ -157,7 +154,6 @@ def test_regime_features(df=None):
     print(f"Output cols: {len(enriched.columns)} (+4 regime)")
     print(f"Validation: {validation}")
     print("Regime: OK")
-    return enriched
 
 
 def test_full_pipeline():
@@ -200,7 +196,6 @@ def test_full_pipeline():
     assert not validation["inf_columns"], f"Inf values found: {validation['inf_columns']}"
 
     print("\nFull Pipeline: OK")
-    return enriched
 
 
 if __name__ == "__main__":

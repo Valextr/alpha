@@ -1,23 +1,21 @@
 """Phase 4: Ensemble & Weights.
 
-Combines individual signals into a meta-predictor.
-
 Exports
 -------
+EnsemblePipeline
+    Unified orchestrator (IC-weighted or LightGBM mode).
+EnsemblePipelineConfig
+    Configuration for the unified pipeline.
 ICWeightedEnsemble
     Rolling IC-weighted linear ensemble.
 EnsembleConfig
-    Configuration dataclass for the ensemble.
-EnsembleMeta
-    Metadata snapshot for auditability.
-ic_to_weights
-    Convert IC values to normalized weights.
-detect_signal_columns
-    Auto-detect signal_* columns from a DataFrame.
-run_ensemble
-    One-call pipeline entry point.
+    Configuration dataclass for the IC-weighted ensemble.
 LightGBMEnsemble
-    Gradient-boosted meta-learner (Phase 4.3, conditional).
+    Gradient-boosted meta-learner (Phase 4.3).
+LightGBMEnsembleConfig
+    Configuration dataclass for the LightGBM meta-learner.
+run_ensemble
+    Legacy: compatibility wrapper around EnsemblePipeline.
 """
 
 from .base import (
@@ -26,24 +24,60 @@ from .base import (
     detect_signal_columns,
     ic_to_weights,
 )
-from .ic_weighted import ICWeightedEnsemble
-from .pipeline import run_ensemble
+from .ic_weighted import (
+    ICWeightedEnsemble,
+    compute_cross_sectional_ic,
+    compute_rolling_ic,
+)
+from .pipeline import (
+    EnsemblePipeline,
+    EnsemblePipelineConfig,
+    run_ensemble,
+)
+from .validation import (
+    EnsembleMetrics,
+    SignalMetrics,
+    WeightStats,
+    compute_cs_ic_stats,
+    format_ensemble_report,
+    format_metrics_table,
+    signal_metrics,
+    validate_ensemble,
+    validate_signals,
+    weight_report,
+)
 
 __all__ = [
+    # Unified pipeline
+    "EnsemblePipeline",
+    "EnsemblePipelineConfig",
+    # Base
     "EnsembleConfig",
     "EnsembleMeta",
-    "ICWeightedEnsemble",
     "detect_signal_columns",
     "ic_to_weights",
+    # IC-weighted ensemble
+    "ICWeightedEnsemble",
+    "compute_cross_sectional_ic",
+    "compute_rolling_ic",
+    # Pipeline
     "run_ensemble",
+    # Validation
+    "SignalMetrics",
+    "EnsembleMetrics",
+    "WeightStats",
+    "compute_cs_ic_stats",
+    "signal_metrics",
+    "validate_signals",
+    "validate_ensemble",
+    "weight_report",
+    "format_metrics_table",
+    "format_ensemble_report",
 ]
 
-# LightGBM is a conditional dependency — import lazily to avoid
-# hard-requiring it during IC-ensemble-only runs.
-# (Kept for backward compatibility with existing __init__.py consumers.)
 try:
-    from .lightgbm import LightGBMEnsemble
+    from .lightgbm import LightGBMEnsemble, LightGBMEnsembleConfig
 
-    __all__.append("LightGBMEnsemble")
+    __all__.extend(["LightGBMEnsemble", "LightGBMEnsembleConfig"])
 except ImportError:
     pass

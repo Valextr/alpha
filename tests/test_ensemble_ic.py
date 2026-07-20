@@ -22,10 +22,10 @@ from src.signals.base import (
 from src.signals.pipeline import generate_all, generate_all_with_forward_returns
 from src.signals import mean_reversion, momentum  # noqa: F401 — registers signals
 from src.features.pipeline import compute_features
+from src.ensemble.base import ic_to_weights
 from src.ensemble.ic_weighted import (
     compute_cross_sectional_ic,
     compute_rolling_ic,
-    ic_to_weights,
     ICWeightedEnsemble,
 )
 

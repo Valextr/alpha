@@ -26,6 +26,8 @@ from typing import Sequence
 
 import polars as pl
 
+from .base import ic_to_weights
+
 
 # ── Core IC functions ────────────────────────────────────────────────
 
@@ -107,69 +109,8 @@ def compute_rolling_ic(
     )
 
 
-# ── Weight computation ───────────────────────────────────────────────
-
-
-def ic_to_weights(
-    ic_values: dict[str, float],
-    method: str = "abs_ic",
-) -> dict[str, float]:
-    """Convert IC values to normalized weights (sum to 1.0).
-
-    Methods
-    -------
-    abs_ic : str
-        Weight proportional to |IC|. A signal with strong predictive power
-        (regardless of direction) receives a larger weight.
-    rank_ic : str
-        Weight proportional to IC rank (1-based). The signal with the
-        highest |IC| gets the largest weight.
-    positive_ic : str
-        Only signals with positive IC contribute. Weight equals IC value.
-        Signals with negative IC receive zero weight.
-
-    Parameters
-    ----------
-    ic_values : dict[str, float]
-        Mapping from signal name to IC value.
-    method : str
-        Weighting method (default ``"abs_ic"``).
-
-    Returns
-    -------
-    dict[str, float]
-        Mapping from signal name to weight. Values sum to 1.0.
-    """
-    if not ic_values:
-        return {}
-
-    if method == "abs_ic":
-        abs_ics = {k: abs(v) for k, v in ic_values.items()}
-        total = sum(abs_ics.values())
-        if total == 0.0:
-            # All ICs are zero — fall back to equal weight
-            n = len(ic_values) or 1
-            return {k: 1.0 / n for k in ic_values}
-        return {k: v / total for k, v in abs_ics.items()}
-
-    if method == "rank_ic":
-        ranked = sorted(ic_values.items(), key=lambda x: abs(x[1]))
-        weights = {k: float(i + 1) for i, (k, _) in enumerate(ranked)}
-        total = sum(weights.values()) or 1.0
-        return {k: v / total for k, v in weights.items()}
-
-    if method == "positive_ic":
-        pos_ics = {k: max(v, 0.0) for k, v in ic_values.items()}
-        total = sum(pos_ics.values())
-        if total > 0:
-            return {k: v / total for k, v in pos_ics.items()}
-        # Fallback to equal weights when all ICs are non-positive
-        n = len(ic_values) or 1
-        return {k: 1.0 / n for k in ic_values}
-
-    # Default fallback: equal weight
-    n = len(ic_values) or 1
-    return {k: 1.0 / n for k in ic_values}
+# NOTE: ic_to_weights() is imported from base.py for use by
+# ICWeightedEnsemble._compute_weight_schedule.
 
 
 # ── Ensemble class ───────────────────────────────────────────────────
@@ -247,16 +188,26 @@ class ICWeightedEnsemble:
 
         weight_schedule = pl.DataFrame(weight_rows)
 
-        # Forward-fill weights to all dates
-        dates_df = pl.DataFrame({"date": all_dates})
-        filled = dates_df.join(weight_schedule, on="date", how="left")
-
+        # Fill all dates with equal weights first, then overlay the computed
+        # schedule. This ensures early dates (before the first rebalance)
+        # still have valid weights instead of null.
         default_w = 1.0 / len(signal_cols) if signal_cols else 0.0
+        dates_df = pl.DataFrame({"date": all_dates})
+        filled = dates_df.with_columns(
+            [pl.lit(default_w).alias(f"w_{sig}") for sig in signal_cols]
+        )
+
+        if weight_schedule.is_empty():
+            return filled
+
+        # Overlay the computed weight schedule on top of the default-equal base
+        filled = filled.join(weight_schedule, on="date", how="left")
+
         for sig in signal_cols:
             wcol = f"w_{sig}"
             if wcol in filled.columns:
-                # Forward-fill from first rebalance, then backfill for
-                # dates before the first rebalance (early period).
+                # Forward-fill from each rebalance point, then backward-fill
+                # for any remaining gaps (should be rare after the above).
                 filled = filled.with_columns(
                     pl.col(wcol).forward_fill().backward_fill().fill_null(default_w)
                 )
