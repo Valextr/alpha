@@ -1,0 +1,187 @@
+{
+  "oos_period": "2020-01-02 to 2023-01-03",
+  "holdback_period": "2023-01-03 to 2026-07-16",
+  "oos_ic": {
+    "signal_mean_reversion_21d": {
+      "1": -0.0069,
+      "5": 0.0075,
+      "21": 0.0108
+    },
+    "signal_mean_reversion_63d": {
+      "1": 0.0059,
+      "5": 0.0128,
+      "21": 0.0229
+    },
+    "signal_momentum_21d": {
+      "1": -0.0062,
+      "5": -0.0119,
+      "21": -0.0117
+    },
+    "signal_momentum_63d": {
+      "1": -0.0057,
+      "5": -0.0168,
+      "21": -0.0084
+    }
+  },
+  "oos_wr": {
+    "signal_mean_reversion_21d": {
+      "1": 0.4968,
+      "5": 0.4941,
+      "21": 0.527
+    },
+    "signal_mean_reversion_63d": {
+      "1": 0.5001,
+      "5": 0.5021,
+      "21": 0.5129
+    },
+    "signal_momentum_21d": {
+      "1": 0.497,
+      "5": 0.5044,
+      "21": 0.5028
+    },
+    "signal_momentum_63d": {
+      "1": 0.4997,
+      "5": 0.5078,
+      "21": 0.5182
+    }
+  },
+  "hb_ic": {
+    "signal_mean_reversion_21d": {
+      "1": 0.0017,
+      "5": 0.0277,
+      "21": 0.0285
+    },
+    "signal_mean_reversion_63d": {
+      "1": 0.0008,
+      "5": 0.0221,
+      "21": 0.014
+    },
+    "signal_momentum_21d": {
+      "1": -0.0044,
+      "5": -0.0134,
+      "21": 0.0115
+    },
+    "signal_momentum_63d": {
+      "1": -0.0039,
+      "5": 0.0045,
+      "21": -0.0027
+    }
+  },
+  "hb_wr": {
+    "signal_mean_reversion_21d": {
+      "1": 0.5005,
+      "5": 0.4954,
+      "21": 0.4874
+    },
+    "signal_mean_reversion_63d": {
+      "1": 0.5022,
+      "5": 0.4848,
+      "21": 0.4838
+    },
+    "signal_momentum_21d": {
+      "1": 0.4968,
+      "5": 0.51,
+      "21": 0.5201
+    },
+    "signal_momentum_63d": {
+      "1": 0.5007,
+      "5": 0.5166,
+      "21": 0.5352
+    }
+  },
+  "comparison": {
+    "signal_mean_reversion_21d": {
+      "signal": "signal_mean_reversion_21d",
+      "oos_ic_1d": -0.0069,
+      "hb_ic_1d": 0.0017,
+      "oos_wr_1d": 0.4968,
+      "hb_wr_1d": 0.5005,
+      "ic_change_1d": 0.0086,
+      "ic_retention_1d_pct": 24.6,
+      "oos_ic_5d": 0.0075,
+      "hb_ic_5d": 0.0277,
+      "oos_wr_5d": 0.4941,
+      "hb_wr_5d": 0.4954,
+      "ic_change_5d": 0.0202,
+      "ic_retention_5d_pct": 369.3,
+      "oos_ic_21d": 0.0108,
+      "hb_ic_21d": 0.0285,
+      "oos_wr_21d": 0.527,
+      "hb_wr_21d": 0.4874,
+      "ic_change_21d": 0.0177,
+      "ic_retention_21d_pct": 263.9
+    },
+    "signal_mean_reversion_63d": {
+      "signal": "signal_mean_reversion_63d",
+      "oos_ic_1d": 0.0059,
+      "hb_ic_1d": 0.0008,
+      "oos_wr_1d": 0.5001,
+      "hb_wr_1d": 0.5022,
+      "ic_change_1d": -0.0051,
+      "ic_retention_1d_pct": 13.6,
+      "oos_ic_5d": 0.0128,
+      "hb_ic_5d": 0.0221,
+      "oos_wr_5d": 0.5021,
+      "hb_wr_5d": 0.4848,
+      "ic_change_5d": 0.0093,
+      "ic_retention_5d_pct": 172.7,
+      "oos_ic_21d": 0.0229,
+      "hb_ic_21d": 0.014,
+      "oos_wr_21d": 0.5129,
+      "hb_wr_21d": 0.4838,
+      "ic_change_21d": -0.0089,
+      "ic_retention_21d_pct": 61.1
+    },
+    "signal_momentum_21d": {
+      "signal": "signal_momentum_21d",
+      "oos_ic_1d": -0.0062,
+      "hb_ic_1d": -0.0044,
+      "oos_wr_1d": 0.497,
+      "hb_wr_1d": 0.4968,
+      "ic_change_1d": 0.0018,
+      "ic_retention_1d_pct": 71.0,
+      "oos_ic_5d": -0.0119,
+      "hb_ic_5d": -0.0134,
+      "oos_wr_5d": 0.5044,
+      "hb_wr_5d": 0.51,
+      "ic_change_5d": -0.0015,
+      "ic_retention_5d_pct": 112.6,
+      "oos_ic_21d": -0.0117,
+      "hb_ic_21d": 0.0115,
+      "oos_wr_21d": 0.5028,
+      "hb_wr_21d": 0.5201,
+      "ic_change_21d": 0.0232,
+      "ic_retention_21d_pct": 98.3
+    },
+    "signal_momentum_63d": {
+      "signal": "signal_momentum_63d",
+      "oos_ic_1d": -0.0057,
+      "hb_ic_1d": -0.0039,
+      "oos_wr_1d": 0.4997,
+      "hb_wr_1d": 0.5007,
+      "ic_change_1d": 0.0018,
+      "ic_retention_1d_pct": 68.4,
+      "oos_ic_5d": -0.0168,
+      "hb_ic_5d": 0.0045,
+      "oos_wr_5d": 0.5078,
+      "hb_wr_5d": 0.5166,
+      "ic_change_5d": 0.0213,
+      "ic_retention_5d_pct": 26.8,
+      "oos_ic_21d": -0.0084,
+      "hb_ic_21d": -0.0027,
+      "oos_wr_21d": 0.5182,
+      "hb_wr_21d": 0.5352,
+      "ic_change_21d": 0.0057,
+      "ic_retention_21d_pct": 32.1
+    }
+  },
+  "tickers": [
+    "MSFT",
+    "GOOGL",
+    "AAPL",
+    "META",
+    "AMZN"
+  ],
+  "oos_rows": 3780,
+  "hb_rows": 4430
+}
