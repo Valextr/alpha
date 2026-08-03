@@ -42,8 +42,8 @@ from src.signals.vwap_reversion_filtered import generate_vwap_mean_reversion_fil
 log = logging.getLogger(__name__)
 
 # US market times (UTC)
-MARKET_OPEN_UTC = ttime(14, 30)   # 09:30 ET winter
-MARKET_CLOSE_UTC = ttime(21, 0)   # 16:00 ET winter
+MARKET_OPEN_UTC = ttime(13, 30)   # 09:30 ET year-round (13:30 UTC EDT / 14:30 UTC EST)
+MARKET_CLOSE_UTC = ttime(20, 0)   # 16:00 ET year-round (20:00 UTC EDT / 21:00 UTC EST)
 MARKET_OPEN_ET = ttime(9, 30)
 MARKET_CLOSE_ET = ttime(16, 0)
 
@@ -135,12 +135,20 @@ class IntradayRunner:
     def _get_engine(self, ticker: str) -> IntradayEngine:
         """Get or create an engine for a ticker."""
         if ticker not in self._engines:
-            broker = PaperBroker(
-                initial_cash=self.config.initial_cash / len(self.config.tickers),
-                commission_per_share=self.config.commission_per_share,
-                slippage_bps=self.config.slippage_bps,
-                price_source={},
-            )
+            if self.config.use_ibkr:
+                from src.execution.ib_broker import IBBroker, IBConfig
+                ib_config = IBConfig(
+                    tws_host=self.config.ibkr_host,
+                    tws_port=self.config.ibkr_port,
+                )
+                broker = IBBroker(ib_config)
+            else:
+                broker = PaperBroker(
+                    initial_cash=self.config.initial_cash / len(self.config.tickers),
+                    commission_per_share=self.config.commission_per_share,
+                    slippage_bps=self.config.slippage_bps,
+                    price_source={},
+                )
             engine_config = IntradayConfig(
                 ticker=ticker,
                 timeframe=self.config.timeframe,
@@ -458,14 +466,6 @@ class IntradayRunner:
             # Connect engines
             for ticker in self.config.tickers:
                 engine = self._get_engine(ticker)
-                if self.config.use_ibkr:
-                    from src.execution.ib_broker import IBBroker, IBConfig
-                    ib_config = IBConfig(
-                        tws_host=self.config.ibkr_host,
-                        tws_port=self.config.ibkr_port,
-                        paper_trading=True,
-                    )
-                    engine.broker = IBBroker(ib_config)
                 engine.connect()
                 engine.start_session()
 
@@ -504,12 +504,12 @@ class IntradayRunner:
         return metrics
 
     def _wait_for_market_open(self) -> None:
-        """Block until market open time."""
-        from datetime import timezone as tz
-        now = datetime.now(tz.utc)
+        """Block until 09:30 ET (America/New_York, DST-aware)."""
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
         target = now.replace(
-            hour=self.config.market_open_utc.hour,
-            minute=self.config.market_open_utc.minute,
+            hour=9,
+            minute=30,
             second=0,
             microsecond=0,
         )
@@ -520,27 +520,25 @@ class IntradayRunner:
             time.sleep(wait_secs)
 
     def _is_market_closed(self) -> bool:
-        """Check if market has closed."""
-        now = datetime.now()
+        """Check if market has closed (16:00 ET, DST-aware)."""
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
         close_time = now.replace(
-            hour=self.config.market_close_utc.hour,
-            minute=self.config.market_close_utc.minute,
+            hour=16,
+            minute=0,
             second=0,
             microsecond=0,
         )
         return now >= close_time
 
     def _fetch_bars(self, ticker: str) -> list[BarRecord]:
-        """Fetch latest bars from IBKR.
+        """Fetch latest bars from IBKR, falling back to yfinance 1-min polling.
 
-        Uses IBKR streaming tick data aggregated through BarBuilder
-        to produce completed bars.
-
-        Args:
-            ticker: Ticker symbol.
-
-        Returns:
-            List of completed bars since last poll.
+        IBKR tick streaming requires a market data subscription; paper accounts
+        without one return error 10089 and the tick buffer stays empty forever
+        (the engine previously wedged silently). After a few empty poll cycles
+        this method switches the ticker to yfinance for the rest of the session.
+        Set ALPHA_DATA_SOURCE=ibkr|yfinance to force a source ("auto" default).
         """
         if not self.config.use_ibkr:
             return []
@@ -549,11 +547,21 @@ class IntradayRunner:
         if not engine or not engine.is_connected:
             return []
 
-        # Get bar builder for this ticker
-        builder = self._get_bar_builder(ticker)
+        # Per-ticker data source state
+        if not hasattr(self, "_data_source"):
+            self._data_source = {}
+        if not hasattr(self, "_empty_polls"):
+            self._empty_polls = {}
 
+        import os
+        forced = os.environ.get("ALPHA_DATA_SOURCE", "auto").lower()
+        if forced == "yfinance":
+            self._data_source[ticker] = "yfinance"
+        if self._data_source.get(ticker) == "yfinance":
+            return self._fetch_bars_yfinance(ticker)
+
+        # --- IBKR tick path ---
         try:
-            # Only works with IBBroker
             from src.execution.ib_broker import IBBroker
             if not isinstance(engine.broker, IBBroker):
                 return []
@@ -584,21 +592,35 @@ class IntradayRunner:
             )
 
             # Small window to collect ticks
-            import time as _time
-            _time.sleep(0.5)
+            time.sleep(0.5)
 
             # Cancel subscription after collecting
-            client._ib.cancelTickByTickData(contract)
+            client._ib.cancelTickByTickData(contract, "Last")
+
+            if not tick_buffer:
+                strikes = self._empty_polls.get(ticker, 0) + 1
+                self._empty_polls[ticker] = strikes
+                if strikes >= 3:
+                    log.warning(
+                        f"{ticker}: no IBKR ticks after {strikes} polls — market data "
+                        "subscription unavailable (error 10089 on paper accounts). "
+                        "Switching to yfinance 1-min polling for this session."
+                    )
+                    self._data_source[ticker] = "yfinance"
+                    return self._fetch_bars_yfinance(ticker)
+                return []
+
+            self._empty_polls[ticker] = 0
 
             # Feed ticks to bar builder
+            builder = self._get_bar_builder(ticker)
             from src.execution.bar_builder import Tick
             for t in tick_buffer:
-                tick = Tick(
+                builder.update(Tick(
                     price=t["price"],
                     volume=t["volume"],
                     timestamp=t["timestamp"],
-                )
-                builder.update(tick)
+                ))
 
             # Return completed bars
             completed = list(builder.completed)
@@ -607,7 +629,94 @@ class IntradayRunner:
 
         except Exception as e:
             log.warning(f"Failed to fetch bars for {ticker}: {e}")
+            # Count exceptions as empty polls so a broken IBKR path (API
+            # mismatch, missing subscription, etc.) still trips the fallback.
+            strikes = self._empty_polls.get(ticker, 0) + 1
+            self._empty_polls[ticker] = strikes
+            if strikes >= 3:
+                log.warning(
+                    f"{ticker}: IBKR bar fetch failing repeatedly ({e}) — "
+                    "switching to yfinance 1-min polling for this session."
+                )
+                self._data_source[ticker] = "yfinance"
+                return self._fetch_bars_yfinance(ticker)
             return []
+
+    def _fetch_bars_yfinance(self, ticker: str) -> list[BarRecord]:
+        """Poll yfinance for completed 1-minute bars (fallback data source).
+
+        yfinance intraday data trails by ~1-2 minutes; only completed bars are
+        emitted so the strategy never acts on a partially-formed minute. Bars
+        are deduplicated by minute timestamp across polls.
+
+        The fetch runs in a single-worker thread pool with a 30s timeout:
+        yfinance's history() has no built-in timeout and can hang indefinitely
+        on a stalled connection, which would wedge the whole session loop.
+        """
+        if not hasattr(self, "_yf_last_fetch"):
+            self._yf_last_fetch = {}
+        if not hasattr(self, "_yf_seen"):
+            self._yf_seen = {}
+        if not hasattr(self, "_yf_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._yf_pool = ThreadPoolExecutor(max_workers=1)
+
+        now = datetime.now()
+        last = self._yf_last_fetch.get(ticker)
+        if last is not None and (now - last).total_seconds() < 55:
+            return []
+        self._yf_last_fetch[ticker] = now
+
+        try:
+            from concurrent.futures import TimeoutError as FutureTimeout
+            future = self._yf_pool.submit(self._yf_fetch, ticker)
+            hist = future.result(timeout=30)
+        except FutureTimeout:
+            log.warning(f"yfinance fetch timed out for {ticker} — skipping cycle")
+            return []
+        except Exception as e:
+            log.warning(f"yfinance fetch failed for {ticker}: {e}")
+            return []
+
+        if hist is None or hist.empty:
+            log.info(f"{ticker}: yfinance fetch returned no data (empty frame)")
+            return []
+
+        hist = hist.reset_index()
+        seen = self._yf_seen.setdefault(ticker, set())
+        cutoff = now.replace(second=0, microsecond=0)
+        new_bars: list[BarRecord] = []
+        for row in hist.itertuples():
+            dt = row.Datetime
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            minute_key = dt.replace(second=0, microsecond=0)
+            if minute_key in seen:
+                continue
+            if minute_key >= cutoff:
+                continue  # incomplete (current) bar — do NOT mark seen, retry next poll
+            seen.add(minute_key)
+            new_bars.append(BarRecord(
+                ticker=ticker,
+                datetime=dt,
+                open=float(row.Open),
+                high=float(row.High),
+                low=float(row.Low),
+                close=float(row.Close),
+                volume=int(row.Volume),
+            ))
+        if new_bars:
+            log.info(
+                f"{ticker}: yfinance delivered {len(new_bars)} new 1-min bars "
+                f"(latest {new_bars[-1].datetime})"
+            )
+        return new_bars
+
+    @staticmethod
+    def _yf_fetch(ticker: str):
+        """Fetch 1-minute bars from yfinance (runs in a worker thread)."""
+        import yfinance as yf
+        return yf.Ticker(ticker).history(period="1d", interval="1m", prepost=False)
 
     def _get_bar_builder(self, ticker: str):
         """Get or create a BarBuilder for a ticker."""

@@ -18,6 +18,7 @@ Requires the `ib` optional dependency:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,12 +34,13 @@ class IBConfig:
     """Interactive Brokers connection configuration.
 
     Thin wrapper around IBKRConfig for backward compatibility.
+    Reads from environment variables (.env) if not explicitly provided.
     """
 
-    tws_host: str = "127.0.0.1"
-    tws_port: int = 4002  # paper trading default
-    client_id: int = 1
-    paper_trading: bool = True
+    tws_host: str = field(default_factory=lambda: os.environ.get("IBKR_HOST", "127.0.0.1"))
+    tws_port: int = field(default_factory=lambda: int(os.environ.get("IBKR_PORT", "4002")))
+    client_id: int = field(default_factory=lambda: int(os.environ.get("IBKR_CLIENT_ID", "1")))
+    paper_trading: bool = field(default_factory=lambda: os.environ.get("IBKR_TRADE_MODE", "PAPER").upper() == "PAPER")
     connect_timeout: float = 30.0
     account: str = ""  # empty = auto-detect
 
