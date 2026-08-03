@@ -428,7 +428,7 @@ class TestYFinanceFallback:
         return IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
 
     def test_incomplete_minute_is_retried_when_completed(self, monkeypatch):
-        base = datetime.now().replace(second=0, microsecond=0)
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         Clock = self._freeze_clock(monkeypatch, base)
         runner = self._runner()
         monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: self._make_frame(base)))
@@ -448,7 +448,7 @@ class TestYFinanceFallback:
         assert runner._fetch_bars_yfinance("MSFT") == []
 
     def test_throttle(self, monkeypatch):
-        base = datetime.now().replace(second=0, microsecond=0)
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         self._freeze_clock(monkeypatch, base)
         runner = self._runner()
         monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: self._make_frame(base)))
@@ -457,8 +457,22 @@ class TestYFinanceFallback:
         # Immediate re-poll within the 55s throttle window returns nothing
         assert runner._fetch_bars_yfinance("MSFT") == []
 
+    def test_naive_datetimes_are_assumed_utc(self, monkeypatch):
+        """Regression (Aug 3 2026 tz fix): naive timestamps must be interpreted
+        as UTC, never local — a UTC-tainted process environment cannot shift
+        the session window. Bars come out tz-aware UTC."""
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        runner = self._runner()
+        naive_frame = self._make_frame(base.replace(tzinfo=None))  # naive index, like old bridge
+        monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: naive_frame))
+
+        bars = runner._fetch_bars_yfinance("MSFT")
+        assert len(bars) == 9  # current minute still excluded (cutoff in UTC)
+        assert all(b.datetime.tzinfo == timezone.utc for b in bars)  # normalized to UTC
+
     def test_empty_frame(self, monkeypatch):
-        base = datetime.now().replace(second=0, microsecond=0)
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         self._freeze_clock(monkeypatch, base)
         runner = self._runner()
         monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: None))
