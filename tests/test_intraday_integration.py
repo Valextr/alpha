@@ -199,10 +199,11 @@ class TestVectorizedFeatures:
         day_df = pl.DataFrame(rows)
         result = runner._compute_session_features("MSFT", day_df)
 
-        # Should have signal column
-        assert "signal_vwap_mean_reversion_60b" in result.columns
+        # Should have signal column (runner uses the FILTERED signal;
+        # the unfiltered 60b variant was replaced in the pipeline)
+        assert "signal_vwap_mean_reversion_filtered" in result.columns
         # Signal values should be bounded
-        signals = result["signal_vwap_mean_reversion_60b"].drop_nulls()
+        signals = result["signal_vwap_mean_reversion_filtered"].drop_nulls()
         assert len(signals) > 0
         assert (signals.abs() <= 1.1).all()  # Allow small margin for rounding
 

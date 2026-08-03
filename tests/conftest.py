@@ -7,6 +7,20 @@ Resource guardrails appended below prevent runaway memory consumption
 during test runs.
 """
 
+import sys
+
+# Production resolves business-logic modules from the private repo first
+# (run.sh / the systemd service do sys.path.insert(0, alpha-private)); the
+# public repo ships stubs for src/features, src/risk, src/ensemble, etc.
+# Pinning the private 'src' package here — at conftest import time, before any
+# test module imports src.* — keeps resolution deterministic in every xdist
+# worker, where per-worker path juggling would otherwise randomly resolve the
+# public stubs and fail ~14 test modules with ImportError.
+_ALPHA_PRIVATE = "/home/Vale/working/alpha-private"
+if _ALPHA_PRIVATE not in sys.path:
+    sys.path.insert(0, _ALPHA_PRIVATE)
+import src  # noqa: F401  (pins sys.modules['src'] to the private tree)
+
 from datetime import date, timedelta
 
 import gc

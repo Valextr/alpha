@@ -387,3 +387,79 @@ class TestLiveIntradayRunner:
         assert "running" in status
         assert "engine_metrics" in status
         assert "bar_builder_stats" in status
+
+
+# ---------------------------------------------------------------------------
+# YFinance fallback (regression: incomplete minutes were marked "seen" before
+# the cutoff check, so the completed bar was skipped forever — Aug 3, 2026)
+# ---------------------------------------------------------------------------
+
+class TestYFinanceFallback:
+    """Tests for IntradayRunner._fetch_bars_yfinance dedupe/throttle logic."""
+
+    @staticmethod
+    def _make_frame(base: datetime, rows: int = 10):
+        """yfinance-shaped DataFrame with 1-min rows ending at `base` (inclusive)."""
+        import pandas as pd
+        idx = pd.date_range(base - timedelta(minutes=rows - 1), periods=rows, freq="min")
+        idx.name = "Datetime"
+        return pd.DataFrame({
+            "Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1000,
+        }, index=idx)
+
+    @staticmethod
+    def _freeze_clock(monkeypatch, start: datetime):
+        """Monkeypatch the runner module's datetime with a controllable clock."""
+        import src.live.intraday_runner as runner_mod
+
+        class _Clock(datetime):
+            _now = start
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls._now if tz is None else cls._now.astimezone(tz)
+
+        monkeypatch.setattr(runner_mod, "datetime", _Clock)
+        return _Clock
+
+    @staticmethod
+    def _runner():
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
+        return IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
+
+    def test_incomplete_minute_is_retried_when_completed(self, monkeypatch):
+        base = datetime.now().replace(second=0, microsecond=0)
+        Clock = self._freeze_clock(monkeypatch, base)
+        runner = self._runner()
+        monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: self._make_frame(base)))
+
+        # First poll: 9 completed minutes; the current minute is skipped, NOT marked seen
+        bars = runner._fetch_bars_yfinance("MSFT")
+        assert len(bars) == 9
+        assert all(b.datetime < base for b in bars)
+        assert base not in runner._yf_seen["MSFT"]
+
+        # Second poll, one minute later: the previously-incomplete minute is complete
+        Clock._now = base + timedelta(minutes=1)
+        bars = runner._fetch_bars_yfinance("MSFT")
+        assert [b.datetime for b in bars] == [base]
+
+        # Third poll: nothing new (dedupe still works for returned bars)
+        assert runner._fetch_bars_yfinance("MSFT") == []
+
+    def test_throttle(self, monkeypatch):
+        base = datetime.now().replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        runner = self._runner()
+        monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: self._make_frame(base)))
+
+        assert len(runner._fetch_bars_yfinance("MSFT")) == 9
+        # Immediate re-poll within the 55s throttle window returns nothing
+        assert runner._fetch_bars_yfinance("MSFT") == []
+
+    def test_empty_frame(self, monkeypatch):
+        base = datetime.now().replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        runner = self._runner()
+        monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: None))
+        assert runner._fetch_bars_yfinance("MSFT") == []

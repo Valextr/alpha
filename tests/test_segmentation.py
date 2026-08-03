@@ -212,9 +212,11 @@ class TestSegmentQuery:
         assert len(result.train) > 0
         assert len(result.validation) > 0
         assert len(result.hold_back) > 0
-        assert set(result.train.get_column("ticker").unique().to_list()) == {
-            "AAPL", "AMZN", "GOOGL", "META", "MSFT",
-        }
+        # Core equities must be present in the train segment. The universe in
+        # data/alpha.duckdb has grown beyond the original 5 tickers, so assert
+        # presence (subset) rather than an exact set match.
+        train_tickers = set(result.train.get_column("ticker").unique().to_list())
+        assert {"AAPL", "AMZN", "GOOGL", "META", "MSFT"}.issubset(train_tickers)
 
     def test_invalid_table_raises(self):
         import pytest
