@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, time as ttime
+from datetime import date, datetime, timedelta, time as ttime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -661,7 +661,7 @@ class IntradayRunner:
             from concurrent.futures import ThreadPoolExecutor
             self._yf_pool = ThreadPoolExecutor(max_workers=1)
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         last = self._yf_last_fetch.get(ticker)
         if last is not None and (now - last).total_seconds() < 55:
             return []
@@ -688,8 +688,14 @@ class IntradayRunner:
         new_bars: list[BarRecord] = []
         for row in hist.itertuples():
             dt = row.Datetime
-            if dt.tzinfo is not None:
-                dt = dt.replace(tzinfo=None)
+            # Normalize to aware UTC: the feature pipeline anchors sessions in
+            # America/New_York and the parquet convention stores UTC. Naive
+            # timestamps are assumed UTC (never local) so a process running in
+            # a UTC-tainted environment cannot shift the session window.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
             minute_key = dt.replace(second=0, microsecond=0)
             if minute_key in seen:
                 continue
