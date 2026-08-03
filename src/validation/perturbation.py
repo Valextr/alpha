@@ -94,6 +94,7 @@ class SignalPerturbationReport:
         - Sensitive: everything in between
         """
         if not self.results:
+            self.status = "no_data"
             return "no_data"
 
         drops = []
@@ -132,12 +133,17 @@ class PerturbationSummary:
 
     def add_report(self, report: SignalPerturbationReport) -> None:
         self.reports.append(report)
+        status = report.classify()
+        if status == "no_data":
+            # Signal could not be generated on this data (missing features);
+            # keep it visible in reports but do not count it as tested.
+            return
         self.total_parameters_tested += 1
-        if report.classify() == "robust":
+        if status == "robust":
             self.robust_count += 1
-        elif report.classify() == "sensitive":
+        elif status == "sensitive":
             self.sensitive_count += 1
-        elif report.classify() == "fragile":
+        elif status == "fragile":
             self.fragile_count += 1
 
     def flag_fragile(self) -> list[str]:
@@ -267,7 +273,12 @@ def _recreate_signal(
         # the standard generator. If the param isn't directly tunable
         # via the function signature, the result may not actually vary.
         # This is a best-effort approach for future signals.
-        return gen_fn(df)
+        result = gen_fn(df)
+        standard_col = f"signal_{signal_name}"
+        perturbed_col = f"signal_{signal_name}_perturbed"
+        if perturbed_col not in result.columns and standard_col in result.columns:
+            result = result.rename({standard_col: perturbed_col})
+        return result
 
 
 # ── Core perturbation test ──────────────────────────────────────────
@@ -298,7 +309,20 @@ def run_perturbation_test(
     perturb_vals = _perturbed_values(baseline_value, pcts)
 
     # Compute baseline metrics first
-    baseline_df = _recreate_signal(df, signal_name, param_name, baseline_value)
+    try:
+        baseline_df = _recreate_signal(df, signal_name, param_name, baseline_value)
+    except Exception as exc:
+        # Signal requires features absent from this data (e.g. an intraday
+        # signal on a daily frame). Report as no_data instead of crashing the
+        # sweep; classify() maps an empty result set to "no_data".
+        print(f"Warning: skipping perturbation for {signal_name}.{param_name}: {exc}")
+        return SignalPerturbationReport(
+            signal_name=signal_name,
+            parameter=param_name,
+            baseline_value=baseline_value,
+            baseline_ic=0.0,
+            baseline_win_rate=0.0,
+        )
     baseline_col = f"signal_{signal_name}_perturbed"
 
     baseline_ic = rank_ic(baseline_col, target_col, baseline_df)
