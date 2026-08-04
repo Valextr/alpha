@@ -49,6 +49,6 @@ coverage.xml
 # Logs
 *.log
 
-# Private strategy repository (sibling)
-../beta/
+# Private strategy repository (sibling; git refuses paths outside this repo,
+# so the guard covers any beta/ dir created inside this tree)
 beta/
