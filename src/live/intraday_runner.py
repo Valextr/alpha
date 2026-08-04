@@ -212,7 +212,10 @@ class IntradayRunner:
 
         # Get the latest signal
         latest = df.tail(1)
-        signal_val = float(latest["signal_vwap_mean_reversion_filtered"].item())
+        # Null signals occur during feature warm-up (rolling VWAP needs 100
+        # samples) and session edges; treat them as "no signal" (0.0) — never
+        # crash the loop on float(None). The engine treats 0 as no action.
+        signal_val = float(latest["signal_vwap_mean_reversion_filtered"].item() or 0.0)
 
         return {
             "close": bar.close,

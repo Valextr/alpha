@@ -572,3 +572,22 @@ class TestAlpacaSource:
         bars = runner._fetch_bars("MSFT")
         assert len(bars) == 9
         assert runner._data_source.get("MSFT") == "alpaca"
+
+    def test_null_signal_treated_as_zero(self, monkeypatch):
+        """Regression (Aug 4 2026): null signals from feature warm-up (rolling
+        VWAP needs 100 samples) crashed the live loop with float(None). Null
+        must become 0.0 — the engine's 'no action' value."""
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig, BarRecord
+        runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
+        # 61 constant-price bars: rolling std == 0 -> std.replace(0, None) ->
+        # base signal null -> polars when-cascade keeps null -> float(None) crash
+        bars = [
+            BarRecord(ticker="MSFT", datetime=base - timedelta(minutes=61 - i),
+                      open=100.0, high=100.0, low=100.0, close=100.0, volume=1000)
+            for i in range(61)
+        ]
+        runner._bar_buffer["MSFT"] = bars[:-1]
+        out = runner._compute_signal("MSFT", bars[-1])
+        assert out[runner.config.signal_column] == 0.0
