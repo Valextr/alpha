@@ -555,8 +555,10 @@ class IntradayRunner:
 
         import os
         forced = os.environ.get("ALPHA_DATA_SOURCE", "auto").lower()
-        if forced == "yfinance":
-            self._data_source[ticker] = "yfinance"
+        if forced in ("alpaca", "yfinance"):
+            self._data_source[ticker] = forced
+        if self._data_source.get(ticker) == "alpaca":
+            return self._fetch_bars_alpaca(ticker)
         if self._data_source.get(ticker) == "yfinance":
             return self._fetch_bars_yfinance(ticker)
 
@@ -604,10 +606,10 @@ class IntradayRunner:
                     log.warning(
                         f"{ticker}: no IBKR ticks after {strikes} polls — market data "
                         "subscription unavailable (error 10089 on paper accounts). "
-                        "Switching to yfinance 1-min polling for this session."
+                        "Switching to alpaca 1-min polling for this session."
                     )
-                    self._data_source[ticker] = "yfinance"
-                    return self._fetch_bars_yfinance(ticker)
+                    self._data_source[ticker] = "alpaca"
+                    return self._fetch_bars_alpaca(ticker)
                 return []
 
             self._empty_polls[ticker] = 0
@@ -636,10 +638,10 @@ class IntradayRunner:
             if strikes >= 3:
                 log.warning(
                     f"{ticker}: IBKR bar fetch failing repeatedly ({e}) — "
-                    "switching to yfinance 1-min polling for this session."
+                    "switching to alpaca 1-min polling for this session."
                 )
-                self._data_source[ticker] = "yfinance"
-                return self._fetch_bars_yfinance(ticker)
+                self._data_source[ticker] = "alpaca"
+                return self._fetch_bars_alpaca(ticker)
             return []
 
     def _fetch_bars_yfinance(self, ticker: str) -> list[BarRecord]:
@@ -723,6 +725,113 @@ class IntradayRunner:
         """Fetch 1-minute bars from yfinance (runs in a worker thread)."""
         import yfinance as yf
         return yf.Ticker(ticker).history(period="1d", interval="1m", prepost=False)
+
+    def _fetch_bars_alpaca(self, ticker: str) -> list[BarRecord]:
+        """Poll Alpaca for completed 1-minute bars (primary fallback source).
+
+        Same contract as the yfinance path: aware-UTC BarRecords, dedupe by
+        UTC minute, current incomplete minute excluded and retried next poll.
+        Uses the same REST bars endpoint as the backtest lake (src/data/alpaca.py),
+        so live bars match the 2025 backtest feed by construction.
+        """
+        if not hasattr(self, "_data_source"):
+            self._data_source = {}
+        if not hasattr(self, "_alpaca_last_fetch"):
+            self._alpaca_last_fetch = {}
+        if not hasattr(self, "_alpaca_seen"):
+            self._alpaca_seen = {}
+        if not hasattr(self, "_alpaca_strikes"):
+            self._alpaca_strikes = {}
+        if not hasattr(self, "_alpaca_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._alpaca_pool = ThreadPoolExecutor(max_workers=1)
+
+        now = datetime.now(timezone.utc)
+        last = self._alpaca_last_fetch.get(ticker)
+        if last is not None and (now - last).total_seconds() < 55:
+            return []
+        self._alpaca_last_fetch[ticker] = now
+
+        try:
+            from concurrent.futures import TimeoutError as FutureTimeout
+            future = self._alpaca_pool.submit(self._alpaca_fetch, ticker, now)
+            hist = future.result(timeout=30)
+        except FutureTimeout:
+            log.warning(f"alpaca fetch timed out for {ticker} — skipping cycle")
+            hist = None
+        except Exception as e:
+            log.warning(f"alpaca fetch failed for {ticker}: {e}")
+            hist = None
+
+        if hist is None or hist.empty:
+            strikes = self._alpaca_strikes.get(ticker, 0) + 1
+            self._alpaca_strikes[ticker] = strikes
+            if strikes >= 3:
+                log.warning(
+                    f"{ticker}: alpaca returning no data after {strikes} polls — "
+                    "switching to yfinance 1-min polling for this session."
+                )
+                self._data_source[ticker] = "yfinance"
+                return self._fetch_bars_yfinance(ticker)
+            return []
+
+        self._alpaca_strikes[ticker] = 0
+        seen = self._alpaca_seen.setdefault(ticker, set())
+        cutoff = now.replace(second=0, microsecond=0)
+        new_bars: list[BarRecord] = []
+        for row in hist.itertuples():
+            dt = row.timestamp
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)     # naive assumed UTC
+            else:
+                dt = dt.astimezone(timezone.utc)
+            minute_key = dt.replace(second=0, microsecond=0)
+            if minute_key in seen:
+                continue
+            if minute_key >= cutoff:
+                continue  # incomplete (current) minute — do NOT mark seen
+            seen.add(minute_key)
+            new_bars.append(BarRecord(
+                ticker=ticker,
+                datetime=dt,
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=int(row.volume),
+            ))
+        if new_bars:
+            log.info(
+                f"{ticker}: alpaca delivered {len(new_bars)} new 1-min bars "
+                f"(latest {new_bars[-1].datetime})"
+            )
+        return new_bars
+
+    @staticmethod
+    def _alpaca_fetch(ticker: str, now: datetime):
+        """Fetch 1-minute bars from Alpaca (runs in a worker thread)."""
+        import os
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        client = StockHistoricalDataClient(
+            api_key=os.environ["ALPACA_API_KEY"],
+            secret_key=os.environ["ALPACA_API_SECRET"],
+        )
+        req = StockBarsRequest(
+            symbol_or_symbols=[ticker],
+            timeframe=TimeFrame.Minute,
+            start=now - timedelta(hours=24),
+            end=now,
+            # feed deliberately NOT pinned here — must match the lake downloader
+            # (src/data/alpaca.py passes no feed). Verified empirically 2026-08-04:
+            # API vs lake for 2025-07-15 are byte-identical (564 bars, volume sum
+            # 14,815,743, close/volume delta 0.0), so the account default feed
+            # equals the backtest lake feed. Pin feed="iex"/"sip" only if a
+            # future comparison shows drift.
+        )
+        return client.get_stock_bars(req).df.reset_index()
 
     def _get_bar_builder(self, ticker: str):
         """Get or create a BarBuilder for a ticker."""

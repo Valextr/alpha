@@ -477,3 +477,98 @@ class TestYFinanceFallback:
         runner = self._runner()
         monkeypatch.setattr(runner, "_yf_fetch", staticmethod(lambda t: None))
         assert runner._fetch_bars_yfinance("MSFT") == []
+
+
+class TestAlpacaSource:
+    """IntradayRunner._fetch_bars_alpaca dedupe/throttle/tz contract."""
+
+    @staticmethod
+    def _make_frame(base: datetime, rows: int = 10, tz: str = "America/New_York"):
+        """Alpaca-shaped DataFrame: reset_index() output with a 'timestamp' column."""
+        import pandas as pd
+        from zoneinfo import ZoneInfo
+        # pandas rejects an aware start with tz=; convert to NY wall time first
+        ny_base = base.astimezone(ZoneInfo(tz)).replace(tzinfo=None)
+        idx = pd.date_range(ny_base - timedelta(minutes=rows - 1), periods=rows,
+                            freq="min", tz=tz)
+        idx.name = "timestamp"
+        return pd.DataFrame({
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+            "volume": 1000, "trade_count": 10, "vwap": 100.2,
+        }, index=idx).reset_index()
+
+    @staticmethod
+    def _freeze_clock(monkeypatch, start: datetime):
+        import src.live.intraday_runner as runner_mod
+
+        class _Clock(datetime):
+            _now = start
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls._now if tz is None else cls._now.astimezone(tz)
+
+        monkeypatch.setattr(runner_mod, "datetime", _Clock)
+        return _Clock
+
+    @staticmethod
+    def _runner(monkeypatch, frame):
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
+        runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
+        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now: frame))
+        return runner
+
+    def test_bars_normalized_to_aware_utc(self, monkeypatch):
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        runner = self._runner(monkeypatch, self._make_frame(base))
+        bars = runner._fetch_bars_alpaca("MSFT")
+        assert len(bars) == 9                      # current minute excluded
+        assert all(b.datetime.tzinfo == timezone.utc for b in bars)
+        # NY 16:00 == UTC 20:00 (EDT) — wall times preserved correctly
+        assert bars[-1].datetime == base - timedelta(minutes=1)
+
+    def test_incomplete_minute_retried_when_completed(self, monkeypatch):
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        Clock = self._freeze_clock(monkeypatch, base)
+        runner = self._runner(monkeypatch, self._make_frame(base))
+        assert len(runner._fetch_bars_alpaca("MSFT")) == 9
+        assert base not in runner._alpaca_seen["MSFT"]
+        Clock._now = base + timedelta(minutes=1)
+        bars = runner._fetch_bars_alpaca("MSFT")
+        assert [b.datetime for b in bars] == [base]
+        assert runner._fetch_bars_alpaca("MSFT") == []  # dedupe
+
+    def test_throttle(self, monkeypatch):
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        runner = self._runner(monkeypatch, self._make_frame(base))
+        assert len(runner._fetch_bars_alpaca("MSFT")) == 9
+        assert runner._fetch_bars_alpaca("MSFT") == []  # 55s window
+
+    def test_falls_back_to_yfinance_after_three_failures(self, monkeypatch):
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        Clock = self._freeze_clock(monkeypatch, base)
+        runner = self._runner(monkeypatch, None)  # _alpaca_fetch returns None
+        # stub the yfinance path too — the 3rd failure hands off to it, and a
+        # unit test must never hit the network
+        monkeypatch.setattr(runner, "_fetch_bars_yfinance", staticmethod(lambda t: []))
+        for _ in range(3):
+            runner._fetch_bars_alpaca("MSFT")
+            Clock._now = Clock._now + timedelta(minutes=1)  # advance past throttle
+        assert runner._data_source.get("MSFT") == "yfinance"
+
+    def test_forced_source_dispatch(self, monkeypatch):
+        """ALPHA_DATA_SOURCE=alpaca routes _fetch_bars straight to Alpaca
+        (no IBKR probe) once an engine is connected."""
+        from types import SimpleNamespace
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self._freeze_clock(monkeypatch, base)
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
+        runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=True))
+        runner._engines["MSFT"] = SimpleNamespace(is_connected=True)
+        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now: self._make_frame(base)))
+        monkeypatch.setenv("ALPHA_DATA_SOURCE", "alpaca")
+        bars = runner._fetch_bars("MSFT")
+        assert len(bars) == 9
+        assert runner._data_source.get("MSFT") == "alpaca"
