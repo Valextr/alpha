@@ -814,6 +814,7 @@ class IntradayRunner:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
 
         client = StockHistoricalDataClient(
             api_key=os.environ["ALPACA_API_KEY"],
@@ -824,12 +825,13 @@ class IntradayRunner:
             timeframe=TimeFrame.Minute,
             start=now - timedelta(hours=24),
             end=now,
-            # feed deliberately NOT pinned here — must match the lake downloader
-            # (src/data/alpaca.py passes no feed). Verified empirically 2026-08-04:
-            # API vs lake for 2025-07-15 are byte-identical (564 bars, volume sum
-            # 14,815,743, close/volume delta 0.0), so the account default feed
-            # equals the backtest lake feed. Pin feed="iex"/"sip" only if a
-            # future comparison shows drift.
+            # feed pinned to "iex": the free-tier account defaults to the SIP
+            # feed for RECENT data and rejects it ("subscription does not
+            # permit querying recent SIP data", observed 2026-08-04), while the
+            # 2025 backtest lake was built from IEX (verified byte-identical for
+            # 2025-07-15: 564 bars, volume sum 14,815,743, delta 0.0). IEX keeps
+            # live bars consistent with the lake by construction.
+            feed=DataFeed.IEX,
         )
         return client.get_stock_bars(req).df.reset_index()
 
