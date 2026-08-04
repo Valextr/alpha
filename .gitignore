@@ -50,5 +50,5 @@ coverage.xml
 *.log
 
 # Private strategy repository (sibling)
-../alpha-private/
-alpha-private/
+../beta/
+beta/
