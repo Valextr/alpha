@@ -592,6 +592,27 @@ class TestAlpacaSource:
         out = runner._compute_signal("MSFT", bars[-1])
         assert out[runner.config.signal_column] == 0.0
 
+    def test_warmup_fills_buffer_without_trading(self):
+        """The session-start backfill must warm the feature buffer only —
+        never create engines or touch the broker (Aug 4 2026 regression:
+        the 24h backfill was traded as a tight loop)."""
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig, BarRecord
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
+
+        def mk(n, offset=0):
+            return [BarRecord(ticker="MSFT", datetime=base - timedelta(minutes=n - i + offset),
+                              open=100.0, high=101.0, low=99.0, close=100.5, volume=1000)
+                    for i in range(n)]
+
+        runner._warmup_bars("MSFT", mk(100))
+        assert len(runner._bar_buffer["MSFT"]) == 100
+        assert len(runner._engines) == 0  # no engine, no orders
+        runner._warmup_bars("MSFT", mk(100, offset=100))
+        assert len(runner._bar_buffer["MSFT"]) == 200
+        runner._warmup_bars("MSFT", mk(600, offset=200))
+        assert len(runner._bar_buffer["MSFT"]) == 500  # capped
+
 
 class _AsyncFillBroker:
     """Broker stub with live-broker semantics: place_market_order returns a

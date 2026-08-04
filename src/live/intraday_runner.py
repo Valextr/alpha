@@ -227,6 +227,18 @@ class IntradayRunner:
             self.config.signal_column: signal_val,
         }
 
+    def _warmup_bars(self, ticker: str, bars: list[BarRecord]) -> None:
+        """Feed historical bars into the feature buffer WITHOUT trading.
+
+        The first fetch of a session returns the 24h window; those bars exist
+        only to warm the feature lookbacks (rolling VWAP, ADX, volume). The
+        engine must never act on them.
+        """
+        buf = self._bar_buffer.setdefault(ticker, [])
+        buf.extend(bars)
+        if len(buf) > 500:
+            self._bar_buffer[ticker] = buf[-500:]
+
     def process_bar(self, ticker: str, bar: BarRecord) -> Optional[dict]:
         """Process a single bar through the full pipeline.
 
@@ -478,6 +490,15 @@ class IntradayRunner:
 
             # Main loop
             log.info("Market open — starting bar stream")
+            # Warm the feature buffer with the initial backfill — the first
+            # fetch returns the 24h window (yesterday's session + pre-market)
+            # and those bars must NEVER trigger orders (Aug 4 2026: the engine
+            # traded the backfill as a tight loop before this warm-up existed).
+            for ticker in self.config.tickers:
+                warm = self._fetch_bars(ticker)
+                self._warmup_bars(ticker, warm)
+                log.info(f"{ticker}: buffer warmed with {len(warm)} historical bars (no trading)")
+
             while self._running and not self._is_market_closed():
                 # Fetch and process bars for each ticker
                 for ticker in self.config.tickers:

@@ -601,6 +601,12 @@ class IBKRClient:
         if not self._connected:
             raise ConnectionError("Not connected to IBKR.")
 
+        # ib_async only populates the positions cache after a reqPositions
+        # request; reading it cold returns stale/empty data (Aug 4 2026:
+        # reconciliation saw "0 positions" while fills were landing). Request
+        # then give the event loop a moment to deliver the update.
+        self._ib.reqPositions()
+        self._ib.sleep(0.75)
         positions = self._ib.positions()
         result = []
 
