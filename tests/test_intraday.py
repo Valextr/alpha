@@ -381,7 +381,7 @@ class TestLiveIntradayRunner:
         assert LiveIntradayRunner._parse_interval("60") == 60
 
     def test_get_status(self):
-        config = IntradayConfig(ticker="MSFT")
+        config = IntradayConfig(ticker="MSFT", max_position_shares=1000)
         runner = LiveIntradayRunner(config)
         status = runner.get_status()
         assert "running" in status
@@ -591,3 +591,103 @@ class TestAlpacaSource:
         runner._bar_buffer["MSFT"] = bars[:-1]
         out = runner._compute_signal("MSFT", bars[-1])
         assert out[runner.config.signal_column] == 0.0
+
+
+class _AsyncFillBroker:
+    """Broker stub with live-broker semantics: place_market_order returns a
+    PENDING order; positions change only when the test simulates a fill."""
+
+    def __init__(self):
+        self.position_qty = 0
+        self.avg_cost = 0.0
+        self.orders = []
+        self.portfolio_value = 1_000_000.0
+
+    def place_market_order(self, ticker, side, quantity, signal_strength=0.0,
+                           target_weight=0.0, fill_price=None):
+        from src.execution.models import Order, OrderStatus, OrderType
+        self.orders.append((side, quantity, fill_price))
+        return Order(ticker=ticker, side=side, order_type=OrderType.MARKET,
+                     quantity=quantity, status=OrderStatus.PENDING)
+
+    def get_positions(self):
+        from src.execution.models import Position
+        if self.position_qty == 0:
+            return {}
+        return {"MSFT": Position(ticker="MSFT", quantity=self.position_qty,
+                                 avg_cost=self.avg_cost)}
+
+    def get_portfolio_value(self):
+        return self.portfolio_value
+
+    def get_current_price(self, ticker):
+        return 100.0
+
+    def set_position(self, qty: int, avg_cost: float = 0.0):
+        self.position_qty = qty
+        if avg_cost:
+            self.avg_cost = avg_cost
+
+
+class TestEngineLivePositionTracking:
+    """Regression (pitfall 30, Aug 4 2026): live brokers fill async; the
+    engine must reconcile from the broker book instead of assuming the
+    synchronous-FILLED return it gets from PaperBroker."""
+
+    @staticmethod
+    def _bar():
+        return {"close": 100.0,
+                "datetime": datetime.now(timezone.utc),
+                "signal_vwap_mean_reversion_filtered": -0.87}
+
+    def test_async_fill_reconciled_next_bar(self):
+        broker = _AsyncFillBroker()
+        engine = IntradayEngine(config=IntradayConfig(ticker="MSFT", max_position_shares=1000), broker=broker)
+        engine.start_session()
+
+        out = engine.process_bar(self._bar())
+        assert out is None                       # async: not recorded same-bar
+        assert len(broker.orders) == 1           # one SELL placed
+        assert engine._position == 0             # fill not visible yet
+        assert engine._pending_order is not None
+
+        # Fill lands (gateway position update arrives between bars)
+        broker.set_position(-870, 100.0)
+        out2 = engine.process_bar(self._bar())
+        assert engine._position == -870          # reconciled to reality
+        assert len(broker.orders) == 1           # no stacking — target == position
+        assert engine._pending_order is None
+        assert len(engine._trades) == 1          # fill recorded
+        assert engine._trades[0]["reconciled"] is True
+
+    def test_no_order_stacking_while_pending(self):
+        broker = _AsyncFillBroker()
+        engine = IntradayEngine(config=IntradayConfig(ticker="MSFT", max_position_shares=1000), broker=broker)
+        engine.start_session()
+
+        for _ in range(3):
+            engine.process_bar(self._bar())
+        assert len(broker.orders) == 1  # one outstanding order, then wait
+
+    def test_unfilled_orders_pause_after_three(self):
+        broker = _AsyncFillBroker()
+        engine = IntradayEngine(config=IntradayConfig(ticker="MSFT", max_position_shares=1000), broker=broker)
+        engine.start_session()
+
+        for _ in range(3):
+            engine.process_bar(self._bar())
+        # bar 1 placed the order; bars 2-4 accumulate strikes -> pause at bar 4
+        engine.process_bar(self._bar())
+        assert engine._order_pause == 4  # set to 5, decremented by the gate
+        n_before = len(broker.orders)
+        engine.process_bar(self._bar())
+        assert len(broker.orders) == n_before  # no new orders during pause
+
+    def test_start_session_adopts_broker_position(self):
+        broker = _AsyncFillBroker()
+        broker.set_position(500, 100.0)
+        engine = IntradayEngine(config=IntradayConfig(ticker="MSFT", max_position_shares=1000), broker=broker)
+        engine.start_session()
+        assert engine._position == 500
+        assert engine._entry_price == 100.0
+        assert len(engine._trades) == 0  # adoption is not a trade

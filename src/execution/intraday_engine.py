@@ -141,6 +141,11 @@ class IntradayEngine:
         self._entry_price: float = 0.0
         self._peak_equity: float = self.config.initial_cash
 
+        # Live-broker async-fill state (pitfall 30)
+        self._pending_order: Optional[dict] = None
+        self._reject_strikes: int = 0
+        self._order_pause: int = 0
+
         # Session state
         self._session_active: bool = False
         self._session_date: Optional[datetime] = None
@@ -198,6 +203,13 @@ class IntradayEngine:
         # Reset daily kill switch
         self.config.kill_switch_active = False
 
+        # Reset live-broker async-fill state and adopt the broker's actual
+        # book (restarting with an open position must not assume flat).
+        self._pending_order = None
+        self._reject_strikes = 0
+        self._order_pause = 0
+        self._reconcile_position(record_trade=False)
+
         initial_equity = self.broker.get_portfolio_value()
         if initial_equity > 0:
             self._peak_equity = initial_equity
@@ -236,7 +248,8 @@ class IntradayEngine:
             if current_price:
                 self._close_position(current_price, "end_of_session")
 
-        # Final equity snapshot
+        # Final equity snapshot (reconcile first so async closes are counted)
+        self._reconcile_position()
         final_equity = self.broker.get_portfolio_value()
 
         self._session_active = False
@@ -283,8 +296,23 @@ class IntradayEngine:
         if not isinstance(close, (int, float)) or close <= 0:
             return None
 
+        # Adopt the broker's actual position (async fills on live brokers)
+        self._reconcile_position()
+
         # Check stop loss / take profit first
         self.check_stop_loss(close)
+
+        # Backoff after repeated unfilled orders (rejected/margin-blocked)
+        if self._order_pause > 0:
+            self._order_pause -= 1
+            log.debug(f"{self.config.ticker}: order pause active ({self._order_pause} bars left)")
+            return None
+
+        # One outstanding live order at a time — wait for its fill to be
+        # reconciled before placing anything else (prevents order stacking).
+        if self._pending_order is not None:
+            log.debug(f"{self.config.ticker}: awaiting fill of {self._pending_order['order_id']}")
+            return None
 
         # Calculate target position based on signal strength
         target_position = int(signal * self.config.max_position_shares)
@@ -309,6 +337,78 @@ class IntradayEngine:
                 return trade
 
         return None
+
+    def _reconcile_position(self, record_trade: bool = True, count_strike: bool = True) -> Optional[dict]:
+        """Adopt the broker's actual position as truth.
+
+        Live brokers (IBKR) fill asynchronously: ``place_market_order``
+        returns PENDING and the fill arrives via the gateway's position
+        updates. The synchronous FILLED check in ``_execute_trade`` never
+        fires for them, so without reconciliation the engine re-submits the
+        full target every bar (pitfall 30 — 27 same-side orders on Aug 4,
+        2026). This adopts the broker book, resolves pending orders, records
+        fills, and enforces a pause after repeated unfilled orders.
+
+        Args:
+            record_trade: Record a trade entry for a detected position change.
+                False for session-start adoption of a pre-existing position.
+            count_strike: Count an unresolved pending order as a rejection
+                strike. False for the immediate post-placement reconcile —
+                an order placed this same call has not yet had a bar to fill.
+
+        Returns:
+            Trade record dict when a position change was detected, else None.
+        """
+        if not hasattr(self.broker, "get_positions"):
+            return None
+        try:
+            pos = self.broker.get_positions().get(self.config.ticker)
+        except Exception as e:
+            log.debug(f"Position reconciliation failed: {e}")
+            return None
+
+        actual = int(pos.quantity) if pos else 0
+
+        if actual == self._position:
+            # Unresolved pending order across bars means it likely failed
+            # (rejected, margin-blocked). Strike toward a pause.
+            if self._pending_order is not None and count_strike:
+                self._reject_strikes += 1
+                if self._reject_strikes >= 3:
+                    log.warning(
+                        f"{self.config.ticker}: 3 consecutive orders without a "
+                        "fill — pausing new orders for 5 bars"
+                    )
+                    self._order_pause = 5
+                    self._pending_order = None
+                    self._reject_strikes = 0
+            return None
+
+        # Position moved — record the fill (delta vs our previous view).
+        delta = actual - self._position
+        pending = self._pending_order or {}
+        fill_price = pos.avg_cost if pos and pos.avg_cost > 0 else pending.get("price", 0.0)
+        commission = abs(delta) * self.config.commission_per_share
+
+        trade_record = None
+        if record_trade:
+            trade_record = {
+                "datetime": pending.get("datetime") or datetime.now(timezone.utc),
+                "shares": delta,
+                "price": fill_price,
+                "commission": commission,
+                "signal": pending.get("signal", 0.0),
+                "position_after": actual,
+                "order_id": pending.get("order_id", ""),
+                "pnl": 0.0,
+                "reconciled": True,
+            }
+            self._trades.append(trade_record)
+        self._position = actual
+        self._entry_price = (pos.avg_cost if pos else 0.0) if actual != 0 else 0.0
+        self._pending_order = None
+        self._reject_strikes = 0
+        return trade_record
 
     def _execute_trade(
         self,
@@ -384,8 +484,20 @@ class IntradayEngine:
 
                 return trade_record
             else:
-                log.debug(f"Order {order.order_id} not filled yet")
-                return None
+                # Live broker: the order is async (PENDING) — the synchronous
+                # FILLED check above never fires for IBBroker. Remember the
+                # order; _reconcile_position() adopts the actual fill at the
+                # next bar (or immediately, if the gateway already reflects it).
+                self._pending_order = {
+                    "shares": shares,
+                    "price": price,
+                    "signal": signal,
+                    "datetime": datetime_val,
+                    "order_id": order.order_id,
+                }
+                # Best-effort immediate adopt (paper fills land in ms); do not
+                # count this same-call check as a rejection strike.
+                return self._reconcile_position(count_strike=False)
 
         except (ValueError, RuntimeError) as e:
             log.warning(f"Trade execution failed: {e}")
