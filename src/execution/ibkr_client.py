@@ -31,9 +31,11 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +55,7 @@ try:
         PortfolioItem,
         Position,
         Ticker,
+        Trade,
         util,
         BarDataList,
         TagValue,
@@ -135,12 +138,15 @@ class IBKRClient:
         self,
         config: Optional[IBKRConfig] = None,
         auto_load_env: bool = True,
+        fills_dir: Optional[Path] = None,
     ):
         """Initialize the IBKR client.
 
         Args:
             config: Configuration override. If None, loads from environment.
             auto_load_env: If True and config is None, load from env vars.
+            fills_dir: Directory for per-fill JSONL logs. Defaults to
+                <repo>/reports/fills.
         """
         if not HAS_IB:
             raise ImportError(
@@ -158,6 +164,9 @@ class IBKRClient:
         self._connected = False
         self._account: str = ""
         self._reconnect_attempts: int = 0
+        self._fills_dir: Path = fills_dir or (
+            Path(__file__).resolve().parents[2] / "reports" / "fills"
+        )
 
         logger.info(
             f"IBKRClient initialized: mode={self.config.trade_mode}, "
@@ -210,6 +219,11 @@ class IBKRClient:
 
             # Discover account
             self._account = self._ib.managedAccounts()[0] if self._ib.managedAccounts() else ""
+
+            # Persist every fill to reports/fills/YYYY-MM-DD.jsonl so realized
+            # slippage vs bar close is measurable from day 1 (Aug 4 2026: the
+            # clean session left fills unmeasured — the noted gap).
+            self._ib.execDetailsEvent += self._on_exec_details
 
             logger.info(
                 f"Connected to IBKR: account={self._account}, "
@@ -662,6 +676,42 @@ class IBKRClient:
 
         logger.info(f"Retrieved {len(result)} fills")
         return result
+
+    def _on_exec_details(self, trade: "Trade", fill: "Fill") -> None:
+        """Append one JSONL row per fill to reports/fills/YYYY-MM-DD.jsonl.
+
+        ib_async v2 attribute mapping (documented in skill): execution.time
+        (UTC), execution.side, execution.shares, execution.price,
+        commissionReport.commission. Append-mode write per fill — a crash
+        between fills never loses previously persisted rows.
+        """
+        try:
+            ts_utc = fill.execution.time
+            if ts_utc is None:
+                return
+            if ts_utc.tzinfo is None:
+                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            else:
+                ts_utc = ts_utc.astimezone(timezone.utc)
+            side_raw = str(fill.execution.side).upper()
+            row = {
+                "ts_utc": ts_utc.isoformat(),
+                "ticker": fill.contract.symbol,
+                "side": {"BOT": "BUY", "SLD": "SELL"}.get(side_raw, side_raw),
+                "shares": float(fill.execution.shares),
+                "price": float(fill.execution.price),
+                "commission": float(fill.commissionReport.commission)
+                if fill.commissionReport
+                else 0.0,
+                "exec_id": fill.execution.execId,
+                "order_id": fill.execution.orderId,
+            }
+            self._fills_dir.mkdir(parents=True, exist_ok=True)
+            path = self._fills_dir / f"{ts_utc.date().isoformat()}.jsonl"
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            logger.exception("fill logging failed")
 
     def get_account_summary(self) -> dict[str, AccountValue]:
         """Get account summary values.

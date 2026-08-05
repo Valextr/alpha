@@ -86,6 +86,10 @@ class IntradayRunnerConfig:
 
     # Signal
     signal_column: str = "signal_vwap_mean_reversion_filtered"
+    # Minimum |signal| to act on — weaker signals are zeroed (engine closes/
+    # flattens), matching the threshold sweep's pre-filter semantics exactly.
+    # 0.0 = trade every nonzero signal (current live behavior).
+    signal_threshold: float = 0.0
 
     # Session
     market_open_utc: ttime = MARKET_OPEN_UTC
@@ -129,8 +133,96 @@ class IntradayRunner:
         self.config = config or IntradayRunnerConfig()
         self._engines: dict[str, IntradayEngine] = {}
         self._bar_buffer: dict[str, list[BarRecord]] = {t: [] for t in self.config.tickers}
+        # Multi-minute aggregation state (timeframe != "1min")
+        self._hour_bars: dict[str, list[BarRecord]] = {t: [] for t in self.config.tickers}
+        self._active_hour_key: dict[str, Optional[datetime]] = {t: None for t in self.config.tickers}
         self._session_date: Optional[date] = None
         self._running: bool = False
+
+    # ------------------------------------------------------------------
+    # Bar aggregation (multi-minute timeframes)
+    # ------------------------------------------------------------------
+
+    def _bar_interval_minutes(self) -> int:
+        """Minutes per aggregated bar from config.timeframe ('1min','5m','15m','30m','1h')."""
+        tf = self.config.timeframe.strip().lower()
+        if tf.endswith("min"):
+            return max(1, int(tf[:-3]))
+        if tf.endswith("m"):
+            return max(1, int(tf[:-1]))
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 60
+        raise ValueError(f"Unsupported timeframe: {self.config.timeframe}")
+
+    @staticmethod
+    def _window_key(dt: datetime) -> datetime:
+        """UTC window key for :30-anchored aggregation — identical alignment
+        to the backtest's group_by_dynamic(..., every='1h', offset='30m').
+
+        Windows start at HH:30 UTC; minutes 13:31..14:29 share one key.
+        """
+        shifted = dt - timedelta(minutes=30)
+        return datetime(shifted.year, shifted.month, shifted.day,
+                        shifted.hour, 0, tzinfo=timezone.utc) if shifted.tzinfo else \
+            shifted.replace(minute=0, second=0, microsecond=0)
+
+    def _flush_hour(self, ticker: str) -> Optional[BarRecord]:
+        """Aggregate the current minute-accumulator into one bar at the
+        window start (matching resample_1h's include_boundaries=False)."""
+        acc = self._hour_bars.get(ticker)
+        key = self._active_hour_key.get(ticker)
+        if not acc or key is None:
+            return None
+        rec = BarRecord(
+            ticker=ticker,
+            datetime=key + timedelta(minutes=30),
+            open=acc[0].open,
+            high=max(b.high for b in acc),
+            low=min(b.low for b in acc),
+            close=acc[-1].close,
+            volume=sum(b.volume for b in acc),
+        )
+        self._hour_bars[ticker] = []
+        self._active_hour_key[ticker] = None
+        return rec
+
+    def _ingest_minute(self, ticker: str, bar: BarRecord,
+                       warm_only: bool = False) -> Optional[dict]:
+        """Route one delivered 1-min bar.
+
+        '1min' mode (or any interval ≤ the delivery granularity): forwards
+        straight to process_bar — byte-identical behavior to pre-change runs.
+        Multi-minute modes ('1h', ...): accumulates; only COMPLETED windows
+        are flushed and reach the signal/engine path. warm_only feeds the
+        aggregated bars into the feature buffer without any trading (same
+        contract as _warmup_bars for the backfill).
+        """
+        if self._bar_interval_minutes() <= 1:
+            if warm_only:
+                buf = self._bar_buffer.setdefault(ticker, [])
+                buf.append(bar)
+                return None
+            return self.process_bar(ticker, bar)
+
+        key = self._window_key(bar.datetime)
+        active = self._active_hour_key.get(ticker)
+        flushed: Optional[BarRecord] = None
+        if self._hour_bars[ticker] and key != active:
+            rec = self._flush_hour(ticker)    # previous window is complete
+            if rec is not None:
+                flushed = rec
+                buf = self._bar_buffer.setdefault(ticker, [])
+                buf.append(rec)               # keep feature buffer fresh
+                if len(buf) > 500:
+                    self._bar_buffer[ticker] = buf[-500:]
+        # Open the new window (if any) and store the current minute —
+        # state MUST be fully updated before anything is processed.
+        if key != active:
+            self._active_hour_key[ticker] = key
+        self._hour_bars.setdefault(ticker, []).append(bar)
+        if flushed is not None and not warm_only:
+            return self.process_bar(ticker, flushed)
+        return None
 
     def _get_engine(self, ticker: str) -> IntradayEngine:
         """Get or create an engine for a ticker."""
@@ -215,7 +307,12 @@ class IntradayRunner:
         # Null signals occur during feature warm-up (rolling VWAP needs 100
         # samples) and session edges; treat them as "no signal" (0.0) — never
         # crash the loop on float(None). The engine treats 0 as no action.
-        signal_val = float(latest["signal_vwap_mean_reversion_filtered"].item() or 0.0)
+        raw_signal = float(latest["signal_vwap_mean_reversion_filtered"].item() or 0.0)
+        # Threshold gate: |signal| < threshold → 0.0 (engine closes/flattens),
+        # identical to the sweep's pre-filter semantics. Default 0.0 = act on
+        # every nonzero signal.
+        if abs(raw_signal) < self.config.signal_threshold:
+            raw_signal = 0.0
 
         return {
             "close": bar.close,
@@ -224,7 +321,7 @@ class IntradayRunner:
             "high": bar.high,
             "low": bar.low,
             "volume": bar.volume,
-            self.config.signal_column: signal_val,
+            self.config.signal_column: float(raw_signal),
         }
 
     def _warmup_bars(self, ticker: str, bars: list[BarRecord]) -> None:
@@ -496,7 +593,18 @@ class IntradayRunner:
             # traded the backfill as a tight loop before this warm-up existed).
             for ticker in self.config.tickers:
                 warm = self._fetch_bars(ticker)
-                self._warmup_bars(ticker, warm)
+                if self._bar_interval_minutes() > 1:
+                    # Multi-minute mode: feed the backfill through the
+                    # aggregator — completed windows fill the feature buffer,
+                    # nothing is traded. Any partial trailing window from the
+                    # fetch (stale historical minutes) must never be flushed
+                    # by live delivery, so drop it here.
+                    for b in warm:
+                        self._ingest_minute(ticker, b, warm_only=True)
+                    self._hour_bars[ticker] = []
+                    self._active_hour_key[ticker] = None
+                else:
+                    self._warmup_bars(ticker, warm)
                 log.info(f"{ticker}: buffer warmed with {len(warm)} historical bars (no trading)")
 
             while self._running and not self._is_market_closed():
@@ -504,7 +612,7 @@ class IntradayRunner:
                 for ticker in self.config.tickers:
                     bars = self._fetch_bars(ticker)
                     for bar in bars:
-                        self.process_bar(ticker, bar)
+                        self._ingest_minute(ticker, bar)
 
                 # Brief sleep to avoid busy-waiting
                 time.sleep(1)
@@ -766,6 +874,8 @@ class IntradayRunner:
             self._alpaca_seen = {}
         if not hasattr(self, "_alpaca_strikes"):
             self._alpaca_strikes = {}
+        if not hasattr(self, "_alpaca_warmup_done"):
+            self._alpaca_warmup_done = {}
         if not hasattr(self, "_alpaca_pool"):
             from concurrent.futures import ThreadPoolExecutor
             self._alpaca_pool = ThreadPoolExecutor(max_workers=1)
@@ -776,9 +886,18 @@ class IntradayRunner:
             return []
         self._alpaca_last_fetch[ticker] = now
 
+        # The first fetch of the session is the warm-up backfill. Multi-minute
+        # timeframes need ~65 calendar days of 1-min bars so the ~390-bar
+        # feature lookback is warm from day 1; the 1min path keeps its 24h
+        # window. Later polls always use the rolling 24h (alpaca-py 0.43.5
+        # paginates internally — page size 10k, next_page_token loop — so one
+        # call returns the full window).
+        warmup_done = self._alpaca_warmup_done.get(ticker, False)
+        lookback_hours = 65 * 24 if (not warmup_done and self._bar_interval_minutes() > 1) else 24
+
         try:
             from concurrent.futures import TimeoutError as FutureTimeout
-            future = self._alpaca_pool.submit(self._alpaca_fetch, ticker, now)
+            future = self._alpaca_pool.submit(self._alpaca_fetch, ticker, now, lookback_hours)
             hist = future.result(timeout=30)
         except FutureTimeout:
             log.warning(f"alpaca fetch timed out for {ticker} — skipping cycle")
@@ -800,6 +919,7 @@ class IntradayRunner:
             return []
 
         self._alpaca_strikes[ticker] = 0
+        self._alpaca_warmup_done[ticker] = True
         seen = self._alpaca_seen.setdefault(ticker, set())
         cutoff = now.replace(second=0, microsecond=0)
         new_bars: list[BarRecord] = []
@@ -832,8 +952,12 @@ class IntradayRunner:
         return new_bars
 
     @staticmethod
-    def _alpaca_fetch(ticker: str, now: datetime):
-        """Fetch 1-minute bars from Alpaca (runs in a worker thread)."""
+    def _alpaca_fetch(ticker: str, now: datetime, lookback_hours: int = 24):
+        """Fetch 1-minute bars from Alpaca (runs in a worker thread).
+
+        lookback_hours: width of the fetch window. The session-start warm-up
+        backfill passes 65*24 for multi-minute timeframes; live polls pass 24.
+        """
         import os
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
@@ -847,7 +971,7 @@ class IntradayRunner:
         req = StockBarsRequest(
             symbol_or_symbols=[ticker],
             timeframe=TimeFrame.Minute,
-            start=now - timedelta(hours=24),
+            start=now - timedelta(hours=lookback_hours),
             end=now,
             # feed pinned to "iex": the free-tier account defaults to the SIP
             # feed for RECENT data and rejects it ("subscription does not

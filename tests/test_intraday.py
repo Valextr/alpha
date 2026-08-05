@@ -182,6 +182,10 @@ class TestBarProcessing:
     def test_kill_switch_blocks_processing(self, engine, bars):
         engine.connect()
         engine.start_session()
+        # Same-day bar: a NEW day clears the breaker (live semantics), so
+        # pin the session date to the bar's date to test the block itself.
+        dt0 = bars[0]["datetime"]
+        engine._session_date = dt0.date() if hasattr(dt0, "date") else dt0
         engine.config.kill_switch_active = True
         result = engine.process_bar(bars[0])
         assert result is None
@@ -515,7 +519,7 @@ class TestAlpacaSource:
     def _runner(monkeypatch, frame):
         from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
         runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
-        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now: frame))
+        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now, lookback_hours=24: frame))
         return runner
 
     def test_bars_normalized_to_aware_utc(self, monkeypatch):
@@ -546,6 +550,38 @@ class TestAlpacaSource:
         assert len(runner._fetch_bars_alpaca("MSFT")) == 9
         assert runner._fetch_bars_alpaca("MSFT") == []  # 55s window
 
+    def test_backfill_window_depends_on_timeframe(self, monkeypatch):
+        """Warm-up backfill width must follow the timeframe: 65 days for 1h
+        (so the ~390-bar feature lookback is warm on day 1), 24h for 1min.
+        Subsequent polls always use the 24h window regardless of timeframe."""
+        from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        Clock = self._freeze_clock(monkeypatch, base)
+        frame = self._make_frame(base)
+        captured = []
+
+        def recorder(ticker, now, lookback_hours):
+            captured.append(lookback_hours)
+            return frame
+
+        # 1h: warm-up fetch requests 65 days
+        runner_1h = IntradayRunner(
+            config=IntradayRunnerConfig(tickers=["MSFT"], timeframe="1h", use_ibkr=False))
+        monkeypatch.setattr(runner_1h, "_alpaca_fetch", staticmethod(recorder))
+        assert len(runner_1h._fetch_bars_alpaca("MSFT")) == 9
+        assert captured[-1] == 65 * 24
+        # 1h: next poll (after throttle) uses the 24h window
+        Clock._now = base + timedelta(minutes=2)
+        runner_1h._fetch_bars_alpaca("MSFT")
+        assert captured[-1] == 24
+        # 1min: warm-up fetch keeps the 24h window
+        Clock._now = base
+        runner_1min = IntradayRunner(
+            config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=False))
+        monkeypatch.setattr(runner_1min, "_alpaca_fetch", staticmethod(recorder))
+        assert len(runner_1min._fetch_bars_alpaca("MSFT")) == 9
+        assert captured[-1] == 24
+
     def test_falls_back_to_yfinance_after_three_failures(self, monkeypatch):
         base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         Clock = self._freeze_clock(monkeypatch, base)
@@ -567,7 +603,7 @@ class TestAlpacaSource:
         from src.live.intraday_runner import IntradayRunner, IntradayRunnerConfig
         runner = IntradayRunner(config=IntradayRunnerConfig(tickers=["MSFT"], use_ibkr=True))
         runner._engines["MSFT"] = SimpleNamespace(is_connected=True)
-        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now: self._make_frame(base)))
+        monkeypatch.setattr(runner, "_alpaca_fetch", staticmethod(lambda t, now, lookback_hours=24: self._make_frame(base)))
         monkeypatch.setenv("ALPHA_DATA_SOURCE", "alpaca")
         bars = runner._fetch_bars("MSFT")
         assert len(bars) == 9
@@ -712,3 +748,235 @@ class TestEngineLivePositionTracking:
         assert engine._position == 500
         assert engine._entry_price == 100.0
         assert len(engine._trades) == 0  # adoption is not a trade
+
+    def test_paper_path_short_agreement_and_sl(self):
+        """Regression (Aug 4 2026): PaperBroker must track shorts as negative
+        quantities so the engine's broker-book reconciliation agrees on the
+        paper path (no phantom-short reset loop, no free-cash compounding),
+        and the synchronous FILLED branch must set a short entry price so
+        SL/TP fire for shorts exactly as on the live reconciliation path."""
+        from src.execution.broker import PaperBroker
+
+        broker = PaperBroker(
+            initial_cash=1_000_000.0,
+            commission_per_share=0.0,
+            slippage_bps=0.0,
+        )
+        engine = IntradayEngine(
+            config=IntradayConfig(
+                ticker="MSFT",
+                max_position_shares=1000,
+                commission_per_share=0.0,
+                slippage_bps=0.0,
+            ),
+            broker=broker,
+        )
+        engine.connect()
+        engine.start_session()
+
+        bar = {"close": 100.0,
+               "datetime": datetime.now(timezone.utc),
+               "signal_vwap_mean_reversion_filtered": -0.87}
+        out = engine.process_bar(dict(bar))
+        assert out is not None
+        assert engine._position == -870
+        assert engine._entry_price == pytest.approx(100.0)
+        # broker book agrees — reconciliation is a no-op, no phantom reset
+        assert broker.get_positions()["MSFT"].quantity == -870
+        assert len(engine._trades) == 1
+
+        # same signal, small move: no re-order, no reconciliation trade
+        bar["close"] = 100.3
+        engine.process_bar(dict(bar))
+        assert engine._position == -870
+        assert len(engine._trades) == 1
+
+        # +0.6% move against the short → stop loss closes it. Signal 0.0 so
+        # the bar doesn't re-enter after the close; the SL path is proven by
+        # the trade's reason (a plain zero-signal close has no reason key).
+        bar["close"] = 100.6
+        bar["signal_vwap_mean_reversion_filtered"] = 0.0
+        engine.process_bar(dict(bar))
+        assert engine._position == 0
+        assert "MSFT" not in broker.get_positions()
+        assert engine._trades[-1].get("reason") == "stop_loss"
+
+    def test_paper_path_long_short_flip_agreement(self):
+        """A full signal flip (short → long) must keep engine and broker
+        books in agreement through the zero crossing."""
+        from src.execution.broker import PaperBroker
+
+        broker = PaperBroker(
+            initial_cash=1_000_000.0,
+            commission_per_share=0.0,
+            slippage_bps=0.0,
+        )
+        engine = IntradayEngine(
+            config=IntradayConfig(
+                ticker="MSFT",
+                max_position_shares=1000,
+                commission_per_share=0.0,
+                slippage_bps=0.0,
+            ),
+            broker=broker,
+        )
+        engine.connect()
+        engine.start_session()
+
+        def bar(sig: float, close: float):
+            return {"close": close,
+                    "datetime": datetime.now(timezone.utc),
+                    "signal_vwap_mean_reversion_filtered": sig}
+
+        # open short -870 @ 100
+        engine.process_bar(bar(-0.87, 100.0))
+        assert engine._position == -870
+        assert broker.get_positions()["MSFT"].quantity == -870
+
+        # flip to long: target +870 from -870 → BUY 1740 (cover + open long);
+        # price stays inside the SL/TP band so no stop fires first
+        engine.process_bar(bar(0.87, 100.1))
+        assert engine._position == 870
+        assert broker.get_positions()["MSFT"].quantity == 870
+        assert engine._entry_price == pytest.approx(100.1)
+        assert len(engine._trades) == 2
+
+        # flip back to short: target -870 from +870 → SELL 1740
+        engine.process_bar(bar(-0.87, 100.2))
+        assert engine._position == -870
+        assert broker.get_positions()["MSFT"].quantity == -870
+        assert engine._entry_price == pytest.approx(100.2)
+        assert len(engine._trades) == 3
+
+    def test_daily_kill_switch_resets_on_date_change(self):
+        """Regression (Aug 4 2026): backtests run one session for the whole
+        period, so the 2% daily loss breaker must reset per calendar day —
+        exactly what the live runner gets from a fresh start_session() each
+        morning. Before this fix the breaker froze the rest of the year
+        after the first 2% drawdown (every ticker stopped at ~107 trades)."""
+        from src.execution.broker import PaperBroker
+
+        broker = PaperBroker(
+            initial_cash=1_000_000.0,
+            commission_per_share=0.0,
+            slippage_bps=0.0,
+        )
+        engine = IntradayEngine(
+            config=IntradayConfig(
+                ticker="MSFT",
+                max_position_shares=1000,
+                stop_loss_pct=1.0,   # effectively disabled — test the breaker
+                take_profit_pct=1.0,  # via normal trades, not SL/TP
+                commission_per_share=0.0,
+                slippage_bps=0.0,
+            ),
+            broker=broker,
+        )
+        engine.connect()
+        engine.start_session()
+
+        day1 = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+        day2 = datetime(2026, 8, 4, 14, 0, tzinfo=timezone.utc)
+
+        # day 1: buy 870 @ 100
+        engine.process_bar({"close": 100.0, "datetime": day1,
+                            "signal_vwap_mean_reversion_filtered": 0.87})
+        # day 1: close at 77 → loss 870×23 = 20,010 = 2.001% → breaker ON
+        out = engine.process_bar({"close": 77.0, "datetime": day1,
+                                  "signal_vwap_mean_reversion_filtered": 0.0})
+        assert out is not None
+        assert engine.config.kill_switch_active is True
+        n_trades = len(engine._trades)
+
+        # day 1: any further signal bar is blocked by the breaker
+        engine.process_bar({"close": 77.0, "datetime": day1,
+                            "signal_vwap_mean_reversion_filtered": 0.87})
+        assert len(engine._trades) == n_trades
+
+        # day 2: first bar clears the breaker and resets the peak
+        out = engine.process_bar({"close": 77.0, "datetime": day2,
+                                  "signal_vwap_mean_reversion_filtered": 0.87})
+        assert out is not None
+        assert engine.config.kill_switch_active is False
+        assert engine._peak_equity == pytest.approx(979_990.0)
+        assert len(engine._trades) == n_trades + 1
+
+    def test_eod_close_on_date_change(self):
+        """Positions left open at the end of a day must be closed when the
+        next day's first bar arrives (live closes at 16:00), then the new
+        day may re-enter on its own signals."""
+        from src.execution.broker import PaperBroker
+
+        broker = PaperBroker(
+            initial_cash=1_000_000.0,
+            commission_per_share=0.0,
+            slippage_bps=0.0,
+        )
+        engine = IntradayEngine(
+            config=IntradayConfig(
+                ticker="MSFT",
+                max_position_shares=1000,
+                commission_per_share=0.0,
+                slippage_bps=0.0,
+            ),
+            broker=broker,
+        )
+        engine.connect()
+        engine.start_session()
+
+        day1 = datetime(2026, 8, 3, 20, 0, tzinfo=timezone.utc)
+        day2 = datetime(2026, 8, 4, 14, 0, tzinfo=timezone.utc)
+
+        # day 1: open a long
+        engine.process_bar({"close": 100.0, "datetime": day1,
+                            "signal_vwap_mean_reversion_filtered": 0.87})
+        assert engine._position == 870
+
+        # day 2 first bar: EOD close first (reason=end_of_session), then the
+        # day-2 signal re-enters — both engine and broker books stay flat
+        # through the close
+        out = engine.process_bar({"close": 100.5, "datetime": day2,
+                                  "signal_vwap_mean_reversion_filtered": 0.87})
+        assert out is not None
+        assert len(engine._trades) == 3
+        assert engine._trades[1]["reason"] == "end_of_session"
+        assert engine._trades[2]["shares"] == 870
+        assert engine._position == 870
+        assert broker.get_positions()["MSFT"].quantity == 870
+
+    def test_metrics_report_true_final_equity_not_peak(self):
+        """Regression (Aug 4 2026): session metrics took the equity curve's
+        MAX as final equity — correct only while equity was monotonic.
+        A losing session must report the broker's actual ending equity."""
+        from src.execution.broker import PaperBroker
+
+        broker = PaperBroker(
+            initial_cash=1_000_000.0,
+            commission_per_share=0.0,
+            slippage_bps=0.0,
+        )
+        engine = IntradayEngine(
+            config=IntradayConfig(
+                ticker="MSFT",
+                max_position_shares=1000,
+                stop_loss_pct=1.0,
+                take_profit_pct=1.0,
+                commission_per_share=0.0,
+                slippage_bps=0.0,
+            ),
+            broker=broker,
+        )
+        engine.connect()
+        engine.start_session()
+
+        day = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+        engine.process_bar({"close": 100.0, "datetime": day,
+                            "signal_vwap_mean_reversion_filtered": 0.87})
+        engine.process_bar({"close": 99.0, "datetime": day + timedelta(minutes=1),
+                            "signal_vwap_mean_reversion_filtered": 0.0})
+        # 870 shares × $1 loss = -$870
+        metrics = engine.end_session(99.0)
+        assert metrics["final_equity"] == pytest.approx(999_130.0)
+        assert metrics["total_pnl"] == pytest.approx(-870.0)
+        assert metrics["total_return_pct"] == pytest.approx(-0.087)
+        assert metrics["position"] == 0
