@@ -130,6 +130,94 @@ class TestPaperBroker:
             broker.place_market_order("AAPL", Side.BUY, 10)
 
 
+class TestPaperBrokerShorts:
+    """Regression (Aug 4 2026): SELL with no position must open a SHORT
+    (negative-quantity position), not silently add cash with no position.
+
+    The engine's broker-book reconciliation (d69f267) adopts the broker's
+    position as truth every bar. With phantom shorts the engine thought it
+    was short while the broker said flat, so reconciliation reset the
+    position and every negative signal became free cash — backtests
+    compounded to +122,349% (MSFT) vs the documented +41%. This class pins
+    the broker-side accounting; the engine-side agreement is covered in
+    tests/test_intraday.py::TestEngineLivePositionTracking.
+    """
+
+    @staticmethod
+    def _broker(**kwargs):
+        kwargs.setdefault("initial_cash", 100_000.0)
+        kwargs.setdefault("commission_per_share", 0.0)
+        kwargs.setdefault("slippage_bps", 0.0)
+        b = PaperBroker(**kwargs)
+        b.connect()
+        return b
+
+    def test_open_short_creates_negative_position(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        pos = b.get_positions()["MSFT"]
+        assert pos.quantity == -500
+        assert pos.avg_cost == 100.0
+        assert pos.market_value == -50_000.0
+
+    def test_short_cash_accounting(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        # cash = 100,000 + 50,000 proceeds; short market value = -50,000
+        assert abs(b.get_portfolio_value() - 100_000.0) < 1e-9
+        # price moved against the short: cover at 101 → loss of 500
+        b.place_market_order("MSFT", Side.BUY, 500, fill_price=101.0)
+        assert "MSFT" not in b.get_positions()
+        assert abs(b.get_portfolio_value() - 99_500.0) < 1e-9
+
+    def test_add_to_short_keeps_entry(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        b.place_market_order("MSFT", Side.SELL, 300, fill_price=102.0)
+        pos = b.get_positions()["MSFT"]
+        assert pos.quantity == -800
+        assert pos.avg_cost == 100.0
+
+    def test_partial_cover_realizes_pnl(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        b.place_market_order("MSFT", Side.BUY, 200, fill_price=98.0)
+        pos = b.get_positions()["MSFT"]
+        assert pos.quantity == -300
+        assert abs(pos.realized_pnl - (100.0 - 98.0) * 200) < 1e-9
+
+    def test_full_cover_removes_position(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        b.place_market_order("MSFT", Side.BUY, 500, fill_price=98.0)
+        assert "MSFT" not in b.get_positions()
+        # profit 2.00 × 500 lands in cash
+        assert abs(b.get_portfolio_value() - 101_000.0) < 1e-9
+
+    def test_long_to_short_flip(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.BUY, 500, fill_price=100.0)
+        b.place_market_order("MSFT", Side.SELL, 800, fill_price=101.0)
+        pos = b.get_positions()["MSFT"]
+        assert pos.quantity == -300
+        assert pos.avg_cost == 101.0
+
+    def test_short_to_long_flip(self):
+        b = self._broker()
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        b.place_market_order("MSFT", Side.BUY, 800, fill_price=98.0)
+        pos = b.get_positions()["MSFT"]
+        assert pos.quantity == 300
+        assert pos.avg_cost == 98.0
+
+    def test_short_commission_deduction(self):
+        b = self._broker(initial_cash=100_000.0, commission_per_share=0.005)
+        b.place_market_order("MSFT", Side.SELL, 500, fill_price=100.0)
+        # cash: 100,000 + 50,000 proceeds − 500×0.005 commission
+        assert abs(b._cash - (150_000.0 - 2.5)) < 1e-9
+        assert b.get_positions()["MSFT"].commissions == 2.5
+
+
 class TestRiskGuard:
     @pytest.fixture
     def risk_config(self):
@@ -372,3 +460,86 @@ class TestExecutionEngine:
         assert len(orders) == 0
 
         engine.stop()
+
+
+class TestFillLogging:
+    """IBKRClient._on_exec_details JSONL fill-logging contract."""
+
+    @staticmethod
+    def _make_fill(ts, side="BOT", symbol="MSFT", shares=950, price=495.94,
+                   commission=0.5, exec_id="exec-1", order_id=123):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            contract=SimpleNamespace(symbol=symbol),
+            execution=SimpleNamespace(
+                time=ts, side=side, shares=shares, price=price,
+                execId=exec_id, orderId=order_id,
+            ),
+            commissionReport=SimpleNamespace(commission=commission),
+        )
+
+    def _client(self, tmp_path):
+        from src.execution.ibkr_client import IBKRClient, IBKRConfig
+        return IBKRClient(config=IBKRConfig(), auto_load_env=False, fills_dir=tmp_path)
+
+    def test_handler_writes_jsonl_row(self, tmp_path):
+        import json
+        from datetime import datetime, timezone
+        client = self._client(tmp_path)
+        ts = datetime(2026, 8, 5, 15, 0, 52, tzinfo=timezone.utc)
+        client._on_exec_details(None, self._make_fill(ts))
+        path = tmp_path / "2026-08-05.jsonl"
+        assert path.exists()
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        row = json.loads(lines[0])
+        assert row == {
+            "ts_utc": "2026-08-05T15:00:52+00:00",
+            "ticker": "MSFT",
+            "side": "BUY",  # BOT normalized
+            "shares": 950,
+            "price": 495.94,
+            "commission": 0.5,
+            "exec_id": "exec-1",
+            "order_id": 123,
+        }
+
+    def test_utc_normalization(self, tmp_path):
+        import json
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        client = self._client(tmp_path)
+        # NY wall time with tzinfo -> stored as UTC (EDT = UTC-4)
+        ts = datetime(2026, 8, 5, 11, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        client._on_exec_details(None, self._make_fill(ts))
+        path = tmp_path / "2026-08-05.jsonl"
+        assert path.exists()
+        row = json.loads(path.read_text(encoding="utf-8").strip())
+        assert row["ts_utc"] == "2026-08-05T15:00:00+00:00"
+
+    def test_sell_side_normalized(self, tmp_path):
+        import json
+        from datetime import datetime, timezone
+        client = self._client(tmp_path)
+        ts = datetime(2026, 8, 5, 15, 0, 52, tzinfo=timezone.utc)
+        client._on_exec_details(None, self._make_fill(ts, side="SLD"))
+        row = json.loads(
+            (tmp_path / "2026-08-05.jsonl").read_text(encoding="utf-8").strip())
+        assert row["side"] == "SELL"
+
+    def test_date_rotation_and_append_does_not_clobber(self, tmp_path):
+        import json
+        from datetime import datetime, timedelta, timezone
+        client = self._client(tmp_path)
+        d1 = datetime(2026, 8, 5, 15, 0, 0, tzinfo=timezone.utc)
+        d2 = datetime(2026, 8, 6, 15, 0, 0, tzinfo=timezone.utc)
+        client._on_exec_details(None, self._make_fill(d1, exec_id="a"))
+        client._on_exec_details(None, self._make_fill(d1 + timedelta(minutes=1), exec_id="b"))
+        client._on_exec_details(None, self._make_fill(d2, exec_id="c"))
+        f1 = tmp_path / "2026-08-05.jsonl"
+        f2 = tmp_path / "2026-08-06.jsonl"
+        assert f1.exists() and f2.exists()
+        rows1 = [json.loads(l) for l in f1.read_text(encoding="utf-8").strip().splitlines()]
+        assert [r["exec_id"] for r in rows1] == ["a", "b"]  # append, no clobber
+        rows2 = [json.loads(l) for l in f2.read_text(encoding="utf-8").strip().splitlines()]
+        assert [r["exec_id"] for r in rows2] == ["c"]

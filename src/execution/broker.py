@@ -237,9 +237,18 @@ class PaperBroker(Broker):
 
         if side == Side.BUY:
             self._cash -= total_cost
-            # Update or create position
-            if ticker in self._positions:
-                pos = self._positions[ticker]
+            pos = self._positions.get(ticker)
+            if pos is None:
+                # Open a new long position
+                self._positions[ticker] = Position(
+                    ticker=ticker,
+                    quantity=quantity,
+                    avg_cost=fill_price,
+                    current_price=fill_price,
+                    commissions=commission_cost,
+                )
+            elif pos.quantity >= 0:
+                # Add to an existing long
                 total_shares = pos.quantity + quantity
                 new_avg = (pos.avg_cost * pos.quantity + fill_price * quantity) / total_shares
                 self._positions[ticker] = Position(
@@ -251,26 +260,14 @@ class PaperBroker(Broker):
                     commissions=pos.commissions + commission_cost,
                 )
             else:
-                self._positions[ticker] = Position(
-                    ticker=ticker,
-                    quantity=quantity,
-                    avg_cost=fill_price,
-                    current_price=fill_price,
-                    commissions=commission_cost,
-                )
-        else:
-            # SELL
-            proceeds = fill_price * quantity - commission_cost
-            self._cash += proceeds
-            if ticker in self._positions:
-                pos = self._positions[ticker]
-                remaining = pos.quantity - quantity
-                if remaining <= 0:
-                    # Full close — calculate realized P&L
-                    realized = (fill_price - pos.avg_cost) * pos.quantity
+                # Cover part of a short: remaining < 0 = still short,
+                # == 0 = flat, > 0 = flipped long at the fill price.
+                covered = min(quantity, -pos.quantity)
+                realized = (pos.avg_cost - fill_price) * covered  # gain when covering below entry
+                remaining = pos.quantity + quantity
+                if remaining == 0:
                     del self._positions[ticker]
-                else:
-                    realized = (fill_price - pos.avg_cost) * quantity
+                elif remaining < 0:
                     self._positions[ticker] = Position(
                         ticker=ticker,
                         quantity=remaining,
@@ -279,6 +276,69 @@ class PaperBroker(Broker):
                         realized_pnl=pos.realized_pnl + realized,
                         commissions=pos.commissions + commission_cost,
                     )
+                else:
+                    self._positions[ticker] = Position(
+                        ticker=ticker,
+                        quantity=remaining,
+                        avg_cost=fill_price,
+                        current_price=fill_price,
+                        realized_pnl=pos.realized_pnl + realized,
+                        commissions=pos.commissions + commission_cost,
+                    )
+        else:
+            # SELL
+            proceeds = fill_price * quantity - commission_cost
+            self._cash += proceeds
+            pos = self._positions.get(ticker)
+            if pos is None:
+                # Open a new SHORT position (negative quantity). The engine's
+                # reconciliation (d69f267) adopts the broker book as truth, so
+                # a SELL with no position MUST create a negative position —
+                # otherwise every negative signal becomes phantom cash and
+                # backtests compound to absurd returns.
+                self._positions[ticker] = Position(
+                    ticker=ticker,
+                    quantity=-quantity,
+                    avg_cost=fill_price,
+                    current_price=fill_price,
+                    commissions=commission_cost,
+                )
+            elif pos.quantity > 0:
+                # Reduce a long: remaining > 0 = still long, == 0 = closed,
+                # < 0 = flipped to short at the fill price.
+                remaining = pos.quantity - quantity
+                realized = (fill_price - pos.avg_cost) * min(pos.quantity, quantity)
+                if remaining == 0:
+                    del self._positions[ticker]
+                elif remaining > 0:
+                    self._positions[ticker] = Position(
+                        ticker=ticker,
+                        quantity=remaining,
+                        avg_cost=pos.avg_cost,
+                        current_price=fill_price,
+                        realized_pnl=pos.realized_pnl + realized,
+                        commissions=pos.commissions + commission_cost,
+                    )
+                else:
+                    self._positions[ticker] = Position(
+                        ticker=ticker,
+                        quantity=remaining,
+                        avg_cost=fill_price,
+                        current_price=fill_price,
+                        realized_pnl=pos.realized_pnl + realized,
+                        commissions=pos.commissions + commission_cost,
+                    )
+            else:
+                # Add to an existing short (entry price unchanged)
+                remaining = pos.quantity - quantity
+                self._positions[ticker] = Position(
+                    ticker=ticker,
+                    quantity=remaining,
+                    avg_cost=pos.avg_cost,
+                    current_price=fill_price,
+                    realized_pnl=pos.realized_pnl,
+                    commissions=pos.commissions + commission_cost,
+                )
 
         # Record fill
         fill = Fill(

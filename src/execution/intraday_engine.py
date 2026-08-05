@@ -149,6 +149,10 @@ class IntradayEngine:
         # Session state
         self._session_active: bool = False
         self._session_date: Optional[datetime] = None
+        # Equity at session start — the correct P&L baseline for a session
+        # (live accounts carry prior gains; the hardcoded initial_cash is
+        # only the backtest seed)
+        self._session_start_equity: float = self.config.initial_cash
 
         # Metrics
         self._trades: list[dict] = []
@@ -213,6 +217,7 @@ class IntradayEngine:
         initial_equity = self.broker.get_portfolio_value()
         if initial_equity > 0:
             self._peak_equity = initial_equity
+        self._session_start_equity = initial_equity if initial_equity > 0 else self.config.initial_cash
 
         self._equity_curve.append({
             "datetime": self._session_date,
@@ -258,7 +263,21 @@ class IntradayEngine:
             f"trades={len(self._trades)}"
         )
 
-        return self.get_session_metrics()
+        metrics = self.get_session_metrics()
+        if metrics:
+            # The curve-based metrics are unreliable for the final value
+            # (only bars with trades are recorded, and the old code took the
+            # curve MAX — fine for monotonic phantom-short runs, wrong the
+            # moment the strategy can lose money). Report the broker's true
+            # final equity and P&L vs the session's start equity.
+            start = self._session_start_equity or self.config.initial_cash
+            metrics["final_equity"] = final_equity
+            metrics["total_pnl"] = final_equity - start
+            metrics["total_return_pct"] = (
+                (final_equity - start) / start * 100 if start > 0 else 0.0
+            )
+
+        return metrics
 
     # ------------------------------------------------------------------
     # Bar processing
@@ -268,10 +287,11 @@ class IntradayEngine:
         """Process a single bar and execute trades if needed.
 
         Pipeline:
-        1. Check kill switch
-        2. Check stop loss / take profit
-        3. Compute target position from signal
-        4. Execute trade through broker if position needs adjustment
+        1. Check session change (new day: EOD close + daily reset)
+        2. Check kill switch
+        3. Check stop loss / take profit
+        4. Compute target position from signal
+        5. Execute trade through broker if position needs adjustment
 
         Args:
             bar: Dictionary with bar data including signal and price.
@@ -280,6 +300,12 @@ class IntradayEngine:
         Returns:
             Trade information if a trade was executed, None otherwise.
         """
+        # Session change (new trading day): close leftover positions and
+        # reset the daily circuit breaker — mirrors the live runner, which
+        # starts a fresh session per day. MUST run before the kill-switch
+        # gate so a new day can clear yesterday's breaker.
+        self._check_session_change(bar)
+
         # Kill switch check
         if self.config.kill_switch_active:
             log.debug("Kill switch active — skipping bar")
@@ -410,6 +436,45 @@ class IntradayEngine:
         self._reject_strikes = 0
         return trade_record
 
+    def _check_session_change(self, bar: dict) -> bool:
+        """Detect a new trading day and reset daily state.
+
+        Live semantics: the runner starts one session per day, so the daily
+        loss circuit breaker resets each morning and positions close at
+        16:00. Backtests run the whole period in one session, so this
+        restores those semantics per calendar day: close any leftover
+        position (EOD close), reset the kill switch / peak equity / daily
+        P&L, and clear pending-order state.
+        """
+        dt_val = bar.get("datetime")
+        if dt_val is None:
+            return False
+        bar_date = dt_val.date() if hasattr(dt_val, "date") else dt_val
+        # _session_date may be a datetime (start_session default) or a date —
+        # normalize before comparing
+        current = self._session_date
+        if isinstance(current, datetime):
+            current = current.date()
+        if bar_date == current:
+            return False
+        if self._session_date is not None:
+            # New day — close any position left over from yesterday at the
+            # first bar of the new day (approximates the 16:00 close).
+            if self._position != 0:
+                close = bar.get("close")
+                if isinstance(close, (int, float)) and close > 0:
+                    self._close_position(float(close), "end_of_session")
+            # Reset the daily circuit breaker like a fresh live session
+            self._daily_pnl = 0.0
+            self._peak_equity = self.broker.get_portfolio_value()
+            self.config.kill_switch_active = False
+            self._pending_order = None
+            self._reject_strikes = 0
+            self._order_pause = 0
+            log.debug(f"Session change: {self._session_date} -> {bar_date}")
+        self._session_date = bar_date
+        return True
+
     def _execute_trade(
         self,
         shares: int,
@@ -447,12 +512,24 @@ class IntradayEngine:
 
                 if side == Side.BUY:
                     self._position += fill_qty
-                    self._entry_price = fill_price
+                    if self._position > 0:
+                        # New/added long (or flipped from short) — entry is
+                        # this fill price (last-fill convention, same as longs)
+                        self._entry_price = fill_price
+                    elif self._position == 0:
+                        self._entry_price = 0.0          # short fully covered
+                    # position still negative → covered part of a short; keep entry
                 else:
-                    # SELL: reduce position
+                    # SELL: reduce long or open/add to short
                     self._position -= fill_qty
-                    if self._position == 0:
+                    if self._position < 0:
+                        # New/added short (or flipped from long) — entry is
+                        # this fill price, so SL/TP fire for shorts exactly as
+                        # they do on the live reconciliation path
+                        self._entry_price = fill_price
+                    elif self._position == 0:
                         self._entry_price = 0.0
+                    # still positive → reduced long; keep entry
 
                 commission = fill_qty * self.config.commission_per_share
 
@@ -659,7 +736,10 @@ class IntradayEngine:
 
         equity = pl.DataFrame(self._equity_curve)
         initial_value = self.config.initial_cash
-        final_value = float(equity["portfolio_value"].max()) if len(equity) > 0 else initial_value
+        # NOTE: last recorded point, NOT the max — the max was only ever
+        # correct while equity was monotonic. end_session() overrides this
+        # with the broker's true final equity.
+        final_value = float(equity["portfolio_value"][-1]) if len(equity) > 0 else initial_value
 
         # Total return
         total_return = (final_value - initial_value) / initial_value * 100 if initial_value > 0 else 0
